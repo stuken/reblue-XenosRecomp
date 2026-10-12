@@ -12,6 +12,19 @@
 
 // SPIR-V vertex input locations, shared with reblue's host input-layout
 // builder. A semantic missing here gets no location from the emitter.
+#ifdef RR6_RECOMP
+// Every semantic an RR6 vertex shader declares.
+#define REBLUE_VERTEX_INPUT_LOCATIONS(X) \
+    X(Position,  0,  0) \
+    X(Normal,    0,  1) \
+    X(Tangent,   0,  2) \
+    X(Tangent,   1,  3) \
+    X(Binormal,  0,  4) \
+    X(TexCoord,  0,  5) \
+    X(TexCoord,  1,  6) \
+    X(TexCoord,  2,  7) \
+    X(Color,     0,  8)
+#else
 #define REBLUE_VERTEX_INPUT_LOCATIONS(X) \
     X(Position,  0,  0) \
     X(Position,  1,  1) \
@@ -24,6 +37,7 @@
     X(TexCoord,  1,  8) \
     X(TexCoord,  2,  9) \
     X(Color,     0, 10)
+#endif
 
 // SPEC_CONSTANTS_ONLY keeps the HLSL below out of host C++ TUs, which IntelliSense would otherwise parse.
 #if (!defined(__cplusplus) || defined(__INTELLISENSE__)) && !defined(SHADER_COMMON_SPEC_CONSTANTS_ONLY)
@@ -55,6 +69,12 @@ struct PushConstants
 #define g_SwappedPositions         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 320)
 #define g_SintTexcoords            vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 324)
 #define g_ShadowPcfScale           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 328)
+#define g_AlphaTestFunc            vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 332)
+#define g_ClipPlaneEnable          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 344)
+#define g_ClipPlanes(i)            vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + 352 + (i)*16)
+#define g_NdcScale                 vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 448)
+#define g_NdcOffset                vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 456)
+#define g_EdgeSnap                 vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 464)
 #else
 #define g_Booleans                 vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256)
 #define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
@@ -80,7 +100,15 @@ struct PushConstants
     uint g_SwappedBlendWeights : packoffset(c19.w); \
     uint g_SwappedPositions : packoffset(c20.x); \
     uint g_SintTexcoords : packoffset(c20.y); \
-    float g_ShadowPcfScale : packoffset(c20.z);
+    float g_ShadowPcfScale : packoffset(c20.z); \
+    uint g_AlphaTestFunc : packoffset(c20.w); \
+    uint g_ClipPlaneEnable : packoffset(c21.z); \
+    float4 g_ClipPlanesArr[6] : packoffset(c22); \
+    float2 g_NdcScale : packoffset(c28.x); \
+    float2 g_NdcOffset : packoffset(c28.z); \
+    float2 g_EdgeSnap : packoffset(c29.x);
+
+#define g_ClipPlanes(i) (g_ClipPlanesArr[(i)])
 
 #define g_Booleans(i) (g_BooleansArr[(i) / 4][(i) % 4])
 #else
@@ -98,6 +126,51 @@ uint g_SpecConstants();
 #ifdef REBLUE_RECOMP
 // Test Xenos boolean register N in the unified VS(0..127)/PS(128..255) file.
 #define BOOL_BIT(n) ((g_Booleans((n) / 32u) & (1u << ((n) & 31u))) != 0)
+#endif
+
+#ifdef REBLUE_RECOMP
+// Fixed-function alpha test: RB_COLORCONTROL ALPHA_FUNC against RB_ALPHA_REF.
+// 0 never, 1 less, 2 equal, 3 less-equal, 4 greater, 5 not-equal,
+// 6 greater-equal, 7 always. ALPHA_TEST is a macro, since the shared constants
+// it reads are declared after this header.
+void alphaTestCompare(float alpha, float ref, uint func)
+{
+    bool pass;
+    switch (func)
+    {
+    case 0: pass = false; break;
+    case 1: pass = alpha < ref; break;
+    case 2: pass = alpha == ref; break;
+    case 3: pass = alpha <= ref; break;
+    case 4: pass = alpha > ref; break;
+    case 5: pass = alpha != ref; break;
+    case 6: pass = alpha >= ref; break;
+    default: pass = true; break;
+    }
+    clip(pass ? 1.0 : -1.0);
+}
+#define ALPHA_TEST(alpha) alphaTestCompare(alpha, g_AlphaThreshold, g_AlphaTestFunc)
+
+// User clip planes (PA_CL_CLIP_CNTL bits 0-5, planes in clip space), written
+// at every VS exit from the clip-space position. A disabled plane keeps all.
+#define USER_CLIP_DISTANCE(i, pos) \
+    ((((g_ClipPlaneEnable >> (i)) & 1u) != 0) ? dot((pos), g_ClipPlanes(i)) : 1.0)
+#define WRITE_USER_CLIP_DISTANCES(pos) \
+    oClipDistance0 = float4(USER_CLIP_DISTANCE(0, pos), USER_CLIP_DISTANCE(1, pos), \
+                            USER_CLIP_DISTANCE(2, pos), USER_CLIP_DISTANCE(3, pos)); \
+    oClipDistance1 = float2(USER_CLIP_DISTANCE(4, pos), USER_CLIP_DISTANCE(5, pos))
+// Resolution scaling: a vertex less than half a guest pixel inside a viewport
+// edge moves onto the edge. The guest tests coverage at guest pixel centres,
+// so such an edge covers the whole outer guest pixel, but at a host scale the
+// sub-pixels nearer the edge would be missed. g_EdgeSnap is that half pixel
+// in NDC, or zero at 1x.
+#define SNAP_TO_VIEWPORT_EDGES(pos) \
+    if (g_EdgeSnap.x > 0.0 && (pos).w > 0.0) { \
+        float2 snapNdc = (pos).xy / (pos).w; \
+        float2 snapInset = 1.0 - abs(snapNdc); \
+        snapNdc = select(and(snapInset > 0.0, snapInset < g_EdgeSnap), sign(snapNdc), snapNdc); \
+        (pos).xy = snapNdc * (pos).w; \
+    }
 #endif
 
 Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);

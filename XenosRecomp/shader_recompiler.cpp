@@ -473,6 +473,13 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
         ++indentation;
     }
 
+    // Xenos co-issues an ALU instruction's vector and scalar halves, and both
+    // read their sources before either writes. The vector result is emitted
+    // first, so a scalar source naming the vector destination register is
+    // read from a snapshot taken before the vector write.
+    uint32_t scalarSnapshotRegister = UINT32_MAX;
+    std::string scalarSnapshotName;
+
     enum
     {
         VECTOR_0,
@@ -552,7 +559,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 
             if (select)
             {
-                regFormatted = fmt::format("r{}", reg);
+                if (reg == scalarSnapshotRegister &&
+                    (operand == SCALAR_0 || operand == SCALAR_1 || operand == SCALAR_CONSTANT_1))
+                    regFormatted = scalarSnapshotName;
+                else
+                    regFormatted = fmt::format("r{}", reg);
             }
             else
             {
@@ -767,6 +778,22 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
     uint32_t vectorWriteMask = instr.vectorWriteMask;
     if (instr.exportData)
         vectorWriteMask &= ~instr.scalarWriteMask;
+
+    if (vectorWriteMask != 0 && exportRegister.empty() && instr.scalarOpcode != AluScalarOpcode::RetainPrev)
+    {
+        // SCALAR_0/1 read src3 when it selects a register; the constant forms
+        // (MULsc etc.) take their register operand from SCALAR_CONSTANT_1.
+        const uint32_t constantFormRegister =
+            (uint32_t(instr.scalarOpcode) & 1) | (instr.src3Select << 1) | (instr.src3Swizzle & 0x3C);
+        if ((instr.src3Select && (instr.src3Register & 0x3F) == instr.vectorDest) ||
+            constantFormRegister == instr.vectorDest)
+        {
+            scalarSnapshotRegister = instr.vectorDest;
+            scalarSnapshotName = fmt::format("s{}", scalarSnapshotCount++);
+            indent();
+            println("float4 {} = r{};", scalarSnapshotName, instr.vectorDest);
+        }
+    }
 
 #ifdef REBLUE_RECOMP
     // A Sgt/Sge whose sources are ShadowTexture taps re-emits per lane as a
@@ -1276,16 +1303,23 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_view& include)
 {
     const auto shaderContainer = reinterpret_cast<const ShaderContainer*>(shaderData);
+    const auto shaderContainer0E = reinterpret_cast<const ShaderContainer0E*>(shaderData);
+    const bool isRevision0E = getShaderContainerRevision(shaderContainer->flags) == SHADER_CONTAINER_REVISION_0E;
 
-    assert((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100);
-    assert(shaderContainer->constantTableOffset != NULL);
+    assert((shaderContainer->flags & 0xFFFF0000) == 0x102A0000);
+    assert(isRevision0E || getShaderContainerRevision(shaderContainer->flags) == SHADER_CONTAINER_REVISION_11);
+
+    const uint32_t constantTableOffset = isRevision0E ? shaderContainer0E->constantTableOffset : shaderContainer->constantTableOffset;
+    const uint32_t definitionTableOffset = isRevision0E ? shaderContainer0E->definitionTableOffset : shaderContainer->definitionTableOffset;
+    const uint32_t shaderOffset = isRevision0E ? shaderContainer0E->shaderOffset : shaderContainer->shaderOffset;
+    assert(constantTableOffset != NULL);
 
     out += include;
     out += '\n';
 
     isPixelShader = (shaderContainer->flags & 0x1) == 0;
 
-    const auto constantTableContainer = reinterpret_cast<const ConstantTableContainer*>(shaderData + shaderContainer->constantTableOffset);
+    const auto constantTableContainer = reinterpret_cast<const ConstantTableContainer*>(shaderData + constantTableOffset);
     constantTableData = reinterpret_cast<const uint8_t*>(&constantTableContainer->constantTable);
 
     out += "#ifdef __spirv__\n\n";
@@ -1302,7 +1336,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
         const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
 
-#ifdef REBLUE_RECOMP
+#if defined(REBLUE_RECOMP) && !defined(RR6_RECOMP)
+        // Blue Dragon's sun-shadow PCF rewrite. RR6 also names a sampler
+        // ShadowTexture, but its kernel is not BD's, so it stays untouched.
         if (isPixelShader && constantInfo->registerSet == RegisterSet::Sampler &&
             strcmp(constantName, "ShadowTexture") == 0)
         {
@@ -1501,7 +1537,63 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     out += '\n';
 
-    const auto shader = reinterpret_cast<const Shader*>(shaderData + shaderContainer->shaderOffset);
+    // Both container revisions reduced to the fields the emitter reads.
+    struct
+    {
+        uint32_t codeOffset; // from the start of the physical section
+        uint32_t codeSize;
+        uint32_t svPosRegister; // 0xFF: none
+        uint32_t interpolatorCount;
+        const be<uint32_t>* interpolators; // PS inputs / VS outputs
+        uint32_t vertexElementCount;
+        const be<uint32_t>* vertexElements;
+        uint32_t pixelOutputs;
+    } shader{};
+
+    if (isRevision0E)
+    {
+        const auto shader0E = reinterpret_cast<const Shader0E*>(shaderData + shaderOffset);
+        shader.codeOffset = 0;
+        shader.codeSize = shaderContainer0E->physicalSize;
+        // No 0x0E header field locates a position input, and no RR6 pixel
+        // shader reads a register that its interpolators or code leave unset.
+        shader.svPosRegister = 0xFF;
+        shader.interpolatorCount = (shader0E->interpolatorInfo >> 5) & 0x1F;
+        if (isPixelShader)
+        {
+            const auto pixelShader = reinterpret_cast<const PixelShader0E*>(shader0E);
+            shader.interpolators = pixelShader->interpolators;
+            shader.pixelOutputs = pixelShader->outputs;
+        }
+        else
+        {
+            const auto vertexShader = reinterpret_cast<const VertexShader0E*>(shader0E);
+            shader.vertexElementCount = vertexShader->vertexElementCount;
+            shader.vertexElements = vertexShader->vertexElementsAndInterpolators + vertexShader->field18;
+            shader.interpolators = shader.vertexElements + shader.vertexElementCount;
+        }
+    }
+    else
+    {
+        const auto shader11 = reinterpret_cast<const Shader*>(shaderData + shaderOffset);
+        shader.codeOffset = shader11->physicalOffset;
+        shader.codeSize = shader11->size;
+        shader.svPosRegister = (shader11->fieldC >> 8) & 0xFF;
+        shader.interpolatorCount = (shader11->interpolatorInfo >> 5) & 0x1F;
+        if (isPixelShader)
+        {
+            const auto pixelShader = reinterpret_cast<const PixelShader*>(shader11);
+            shader.interpolators = pixelShader->interpolators;
+            shader.pixelOutputs = pixelShader->outputs;
+        }
+        else
+        {
+            const auto vertexShader = reinterpret_cast<const VertexShader*>(shader11);
+            shader.vertexElementCount = vertexShader->vertexElementCount;
+            shader.vertexElements = vertexShader->vertexElementsAndInterpolators + vertexShader->field18;
+            shader.interpolators = shader.vertexElements + shader.vertexElementCount;
+        }
+    }
 
     out += "#ifndef __spirv__\n";
 
@@ -1534,22 +1626,20 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         out += "\tin uint iFace : SV_IsFrontFace\n";
         out += "#endif\n";
 
-        auto pixelShader = reinterpret_cast<const PixelShader*>(shader);
-        if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR0)
+        if (shader.pixelOutputs & PIXEL_SHADER_OUTPUT_COLOR0)
             out += ",\n\tout float4 oC0 : SV_Target0";
-        if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR1)
+        if (shader.pixelOutputs & PIXEL_SHADER_OUTPUT_COLOR1)
             out += ",\n\tout float4 oC1 : SV_Target1";
-        if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR2)
+        if (shader.pixelOutputs & PIXEL_SHADER_OUTPUT_COLOR2)
             out += ",\n\tout float4 oC2 : SV_Target2";
-        if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_COLOR3)
+        if (shader.pixelOutputs & PIXEL_SHADER_OUTPUT_COLOR3)
             out += ",\n\tout float4 oC3 : SV_Target3";
-        if (pixelShader->outputs & PIXEL_SHADER_OUTPUT_DEPTH)
+        if (shader.pixelOutputs & PIXEL_SHADER_OUTPUT_DEPTH)
             out += ",\n\tout float oDepth : SV_Depth";
     }
     else
     {
-        auto vertexShader = reinterpret_cast<const VertexShader*>(shader);
-        for (uint32_t i = 0; i < vertexShader->vertexElementCount; i++)
+        for (uint32_t i = 0; i < shader.vertexElementCount; i++)
         {
             union
             {
@@ -1557,7 +1647,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                 uint32_t value;
             };
 
-            value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + i];
+            value = shader.vertexElements[i];
 
             const char* usageType = USAGE_TYPES[uint32_t(vertexElement.usage)];
 
@@ -1601,6 +1691,13 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
         for (auto& [usage, usageIndex] : INTERPOLATORS)
             print(",\n\tout float4 o{0}{1} : {2}{1}", USAGE_VARIABLES[uint32_t(usage)], usageIndex, USAGE_SEMANTICS[uint32_t(usage)]);
+
+    #ifdef REBLUE_RECOMP
+        // Last, so the interpolators keep the registers the pixel shader's
+        // input signature expects.
+        out += ",\n\tout float4 oClipDistance0 : SV_ClipDistance0";
+        out += ",\n\tout float2 oClipDistance1 : SV_ClipDistance1";
+    #endif
     }
 
     out += ")\n";
@@ -1621,9 +1718,68 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     }
 #endif
 
-    if (shaderContainer->definitionTableOffset != NULL)
+    // One literal float4 register, shared by both container revisions.
+    auto printFloat4Definition = [&](uint32_t reg, const be<uint32_t>* value)
     {
-        auto definitionTable = reinterpret_cast<const DefinitionTable*>(shaderData + shaderContainer->definitionTableOffset);
+#ifdef REBLUE_RECOMP
+        // BD bakes the sun-shadow receiver PCF tap offsets as shader
+        // literals in 1/1024-of-the-map UV units, folded into 0.5+k
+        // and 1.0+k anchors plus the raw 1/1024 frac-stagger stride.
+        // Their world footprint scales with the shadow coverage box
+        // (bd_shadow_distance), so re-anchor each such component on
+        // g_ShadowPcfScale (SharedConstants c20.z, byte 328, =
+        // max(1/distance, 1024/dimension)). Bit-exact identity at
+        // scale 1.0. Gated to pixel shaders sampling ShadowTexture;
+        // the +/-3/1024 window (anchors excluded) matches exactly the
+        // kernel literals across every BD receiver and nothing else.
+        auto shadowKernelComponent = [&](uint32_t u) -> std::string
+        {
+            if (hasShadowTexture)
+            {
+                if (u == 0x3A800000)
+                    return fmt::format("(asfloat(0x{:X}u) * g_ShadowPcfScale)", u);
+                float f;
+                memcpy(&f, &u, sizeof(f));
+                for (float anchor : { 0.5f, 1.0f })
+                {
+                    float d = f > anchor ? f - anchor : anchor - f;
+                    if (f != anchor && d <= 3.0f / 1024.0f)
+                        return fmt::format("({} + (asfloat(0x{:X}u) - {}) * g_ShadowPcfScale)", anchor, u, anchor);
+                }
+            }
+            return fmt::format("asfloat(0x{:X}u)", u);
+        };
+        println("\tfloat4 c{} = float4({}, {}, {}, {});",
+            reg,
+            shadowKernelComponent(value[0].get()), shadowKernelComponent(value[1].get()),
+            shadowKernelComponent(value[2].get()), shadowKernelComponent(value[3].get()));
+#else
+        println("\tfloat4 c{} = asfloat(uint4(0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}));",
+            reg, value[0].get(), value[1].get(), value[2].get(), value[3].get());
+#endif
+    };
+
+    if (isRevision0E && definitionTableOffset != NULL)
+    {
+        auto definitionTable = reinterpret_cast<const DefinitionTable0E*>(shaderData + definitionTableOffset);
+        auto definitions = definitionTable->definitions;
+        while (*definitions != 0)
+        {
+            auto definition = reinterpret_cast<const Float4Definition0E*>(definitions);
+            const uint32_t baseRegister = getFloat4DefinitionRegister0E(definition->registerAddress);
+            for (uint16_t i = 0; i < (definition->count + 3) / 4; i++)
+                printFloat4Definition(baseRegister + i, definition->values + i * 4);
+            definitions += 1 + definition->count;
+        }
+        ++definitions;
+        // No RR6 shader defines int4 literals, so their 0x0E encoding is unknown.
+        if (*definitions != 0)
+            out += "#error XenosRecomp: container revision 0x0E int4 definitions are not supported\n";
+        out += "\n";
+    }
+    else if (definitionTableOffset != NULL)
+    {
+        auto definitionTable = reinterpret_cast<const DefinitionTable*>(shaderData + definitionTableOffset);
         auto definitions = definitionTable->definitions;
         while (*definitions != 0)
         {
@@ -1631,43 +1787,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             auto value = reinterpret_cast<const be<uint32_t>*>(shaderData + shaderContainer->virtualSize + definition->physicalOffset);
             for (uint16_t i = 0; i < (definition->count + 3) / 4; i++)
             {
-#ifdef REBLUE_RECOMP
-                // BD bakes the sun-shadow receiver PCF tap offsets as shader
-                // literals in 1/1024-of-the-map UV units, folded into 0.5+k
-                // and 1.0+k anchors plus the raw 1/1024 frac-stagger stride.
-                // Their world footprint scales with the shadow coverage box
-                // (bd_shadow_distance), so re-anchor each such component on
-                // g_ShadowPcfScale (SharedConstants c20.z, byte 328, =
-                // max(1/distance, 1024/dimension)). Bit-exact identity at
-                // scale 1.0. Gated to pixel shaders sampling ShadowTexture;
-                // the +/-3/1024 window (anchors excluded) matches exactly the
-                // kernel literals across every BD receiver and nothing else.
-                auto shadowKernelComponent = [&](uint32_t u) -> std::string
-                {
-                    if (hasShadowTexture)
-                    {
-                        if (u == 0x3A800000)
-                            return fmt::format("(asfloat(0x{:X}u) * g_ShadowPcfScale)", u);
-                        float f;
-                        memcpy(&f, &u, sizeof(f));
-                        for (float anchor : { 0.5f, 1.0f })
-                        {
-                            float d = f > anchor ? f - anchor : anchor - f;
-                            if (f != anchor && d <= 3.0f / 1024.0f)
-                                return fmt::format("({} + (asfloat(0x{:X}u) - {}) * g_ShadowPcfScale)", anchor, u, anchor);
-                        }
-                    }
-                    return fmt::format("asfloat(0x{:X}u)", u);
-                };
-                println("\tfloat4 c{} = float4({}, {}, {}, {});",
-                    definition->registerIndex + i - (isPixelShader ? 256 : 0),
-                    shadowKernelComponent(value[0].get()), shadowKernelComponent(value[1].get()),
-                    shadowKernelComponent(value[2].get()), shadowKernelComponent(value[3].get()));
-#else
-                println("\tfloat4 c{} = asfloat(uint4(0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}));",
-                    definition->registerIndex + i - (isPixelShader ? 256 : 0), value[0].get(), value[1].get(), value[2].get(), value[3].get());
-#endif
-
+                printFloat4Definition(definition->registerIndex + i - (isPixelShader ? 256 : 0), value);
                 value += 4;
             }
             definitions += 2;
@@ -1704,26 +1824,23 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     bool printedRegisters[32]{};
 
-    uint32_t interpolatorCount = (shader->interpolatorInfo >> 5) & 0x1F;
-
-    for (uint32_t i = 0; i < interpolatorCount; i++)
+    for (uint32_t i = 0; i < shader.interpolatorCount; i++)
     {
         union
         {
             Interpolator interpolator;
             uint32_t value;
         };
-    
+
+        value = shader.interpolators[i];
+
         if (isPixelShader)
         {
-            value = reinterpret_cast<const PixelShader*>(shader)->interpolators[i];
             println("\tfloat4 r{} = i{}{};", uint32_t(interpolator.reg), USAGE_VARIABLES[uint32_t(interpolator.usage)], uint32_t(interpolator.usageIndex));
             printedRegisters[interpolator.reg] = true;
         }
         else
         {
-            auto vertexShader = reinterpret_cast<const VertexShader*>(shader);
-            value = vertexShader->vertexElementsAndInterpolators[vertexShader->field18 + vertexShader->vertexElementCount + i];
             interpolators.emplace(i, fmt::format("o{}{}", USAGE_VARIABLES[uint32_t(interpolator.usage)], uint32_t(interpolator.usageIndex)));
         }
     }
@@ -1736,6 +1853,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     #elif defined(REBLUE_RECOMP)
         // Always define SV_Position so a skipped position-write block doesn't leave it undef.
         out += "\toPos = 0.0;\n";
+        out += "\toClipDistance0 = 1.0;\n";
+        out += "\toClipDistance1 = 1.0;\n";
     #endif
 
         for (auto& [usage, usageIndex] : INTERPOLATORS)
@@ -1749,7 +1868,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         if (!printedRegisters[i])
         {
             print("\tfloat4 r{} = ", i);
-            if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
+            if (isPixelShader && i == shader.svPosRegister)
             {
                 out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
             }
@@ -1782,7 +1901,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 #endif
     }
 
-    const be<uint32_t>* code = reinterpret_cast<const be<uint32_t>*>(shaderData + shaderContainer->virtualSize + shader->physicalOffset);
+    const be<uint32_t>* code = reinterpret_cast<const be<uint32_t>*>(shaderData + shaderContainer->virtualSize + shader.codeOffset);
 
     union
     {
@@ -1798,7 +1917,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     auto controlFlowCode = code;
     uint32_t instrAddress = 0;
-    uint32_t instrSize = shader->size;
+    uint32_t instrSize = shader.codeSize;
     bool simpleControlFlow = true;
 
     // Per-instruction control flow summary for the structurizer below.
@@ -2294,7 +2413,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     out += '{';
 
                     indent();
+                #ifdef REBLUE_RECOMP
+                    out += "\tALPHA_TEST(oC0.w);\n";
+                #else
                     out += "\tclip(oC0.w - g_AlphaThreshold);\n";
+                #endif
 
                     indent();
                     out += "}";
@@ -2322,7 +2445,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     if (!hasMtxProjection)
                 #endif
                     {
+                    #ifdef REBLUE_RECOMP
+                        out += "\tWRITE_USER_CLIP_DISTANCES(oPos);\n";
+                        // g_NdcScale/g_NdcOffset map window-space positions
+                        // to NDC while the guest viewport transform is off.
+                        out += "\toPos.xy = oPos.xy * g_NdcScale + (g_NdcOffset + g_HalfPixelOffset) * oPos.w;\n";
+                        out += "\tSNAP_TO_VIEWPORT_EDGES(oPos);\n";
+                    #else
                         out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
+                    #endif
                     }
                 }
 

@@ -36,6 +36,8 @@ struct ShaderRecompiler : StringBuffer
     // emitted (then-branch close is part of the event, not ifEndLabels).
     std::unordered_set<uint32_t> elseLabels;
     uint32_t specConstantsMask = 0;
+    // Names the snapshots taken for co-issued scalar ops (see recompile(AluInstruction)).
+    uint32_t scalarSnapshotCount = 0;
 
 #ifdef UNLEASHED_RECOMP
     bool hasMtxProjection = false;

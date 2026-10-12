@@ -109,10 +109,25 @@ int main(int argc, char** argv)
                 auto shaderContainer = reinterpret_cast<const ShaderContainer*>(fileData.get() + i);
                 size_t dataSize = shaderContainer->virtualSize + shaderContainer->physicalSize;
 
-                if ((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100 &&
-                    dataSize <= (fileSize - i) &&
-                    shaderContainer->field1C == 0 &&
-                    shaderContainer->field20 == 0)
+                // Revision 0x0E has a six dword header, so field1C/field20 are
+                // its CTAB instead. Match it on a well-formed CTAB header.
+                auto isContainer0E = [&]
+                {
+                    auto container0E = reinterpret_cast<const ShaderContainer0E*>(shaderContainer);
+                    if ((shaderContainer->flags & 0xFFFFFE00) != 0x102A0E00 ||
+                        container0E->constantTableOffset + sizeof(ConstantTableContainer) > container0E->virtualSize)
+                        return false;
+                    auto constantTable = reinterpret_cast<const ConstantTableContainer*>(
+                        reinterpret_cast<const uint8_t*>(shaderContainer) + container0E->constantTableOffset);
+                    const uint32_t version = (shaderContainer->flags & 0x1) ? 0xFFFE0300 : 0xFFFF0300;
+                    return constantTable->constantTable.size == 0x1C && constantTable->constantTable.version == version;
+                };
+
+                if (dataSize <= (fileSize - i) &&
+                    (((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100 &&
+                      shaderContainer->field1C == 0 &&
+                      shaderContainer->field20 == 0) ||
+                     isContainer0E()))
                 {
                     XXH64_hash_t hash = XXH3_64bits(shaderContainer, dataSize);
                     auto shader = shaders.try_emplace(hash);
