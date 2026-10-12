@@ -84,6 +84,15 @@ struct PushConstants
 
 [[vk::constant_id(0)]] const uint g_SpecConstants = 0;
 
+#ifdef REBLUE_RECOMP
+// DXC takes the PointSize builtin on a struct member only, not on a bare
+// entry point parameter.
+struct PointSizeOutput
+{
+    [[vk::builtin("PointSize")]] float size : PSIZE;
+};
+#endif
+
 #define g_SpecConstants() g_SpecConstants
 
 #else

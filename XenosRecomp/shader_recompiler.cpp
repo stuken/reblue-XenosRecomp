@@ -1697,11 +1697,22 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         // input signature expects.
         out += ",\n\tout float4 oClipDistance0 : SV_ClipDistance0";
         out += ",\n\tout float2 oClipDistance1 : SV_ClipDistance1";
+        // Vulkan leaves the size of a point undefined unless the vertex shader
+        // writes it (VUID-VkGraphicsPipelineCreateInfo-topology-08773). The
+        // host draws guest points one pixel wide, as D3D12 does.
+        out += "\n#ifdef __spirv__\n";
+        out += "\t, out PointSizeOutput oPointSize\n";
+        out += "#endif\n";
     #endif
     }
 
     out += ")\n";
     out += "{\n";
+
+#ifdef REBLUE_RECOMP
+    if (!isPixelShader)
+        out += "#ifdef __spirv__\n\toPointSize.size = 1.0;\n#endif\n";
+#endif
 
 #ifdef UNLEASHED_RECOMP
     if (hasMtxProjection)
