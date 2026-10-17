@@ -13,7 +13,8 @@
 // SPIR-V vertex input locations, shared with reblue's host input-layout
 // builder. A semantic missing here gets no location from the emitter.
 #ifdef RR6_RECOMP
-// Every semantic an RR6 vertex shader declares.
+// Every semantic an RR6 or Project Sylpheed vertex shader declares. Sylpheed
+// adds POSITION1 (three of its vertex shaders blend two positions).
 #define REBLUE_VERTEX_INPUT_LOCATIONS(X) \
     X(Position,  0,  0) \
     X(Normal,    0,  1) \
@@ -23,7 +24,8 @@
     X(TexCoord,  0,  5) \
     X(TexCoord,  1,  6) \
     X(TexCoord,  2,  7) \
-    X(Color,     0,  8)
+    X(Color,     0,  8) \
+    X(Position,  1,  9)
 #else
 #define REBLUE_VERTEX_INPUT_LOCATIONS(X) \
     X(Position,  0,  0) \
@@ -75,6 +77,8 @@ struct PushConstants
 #define g_NdcScale                 vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 448)
 #define g_NdcOffset                vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 456)
 #define g_EdgeSnap                 vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 464)
+#define g_PointSpriteScale         vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 472)
+#define g_PointSizeDefault         vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 480)
 #else
 #define g_Booleans                 vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256)
 #define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
@@ -115,7 +119,9 @@ struct PointSizeOutput
     float4 g_ClipPlanesArr[6] : packoffset(c22); \
     float2 g_NdcScale : packoffset(c28.x); \
     float2 g_NdcOffset : packoffset(c28.z); \
-    float2 g_EdgeSnap : packoffset(c29.x);
+    float2 g_EdgeSnap : packoffset(c29.x); \
+    float2 g_PointSpriteScale : packoffset(c29.z); \
+    float g_PointSizeDefault : packoffset(c30.x);
 
 #define g_ClipPlanes(i) (g_ClipPlanesArr[(i)])
 
@@ -180,12 +186,59 @@ void alphaTestCompare(float alpha, float ref, uint func)
         snapNdc = select(and(snapInset > 0.0, snapInset < g_EdgeSnap), sign(snapNdc), snapNdc); \
         (pos).xy = snapNdc * (pos).w; \
     }
+// Point sprites: the host draws a point list as four copies of each vertex,
+// and g_PointSpriteScale (NDC per pixel, zero outside point draws) spreads
+// them into a square of the point's size in pixels: what the shader exported
+// in oMisc.x, else the PA_SU_POINT_SIZE default. Corners by vertex id & 3:
+// 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right.
+#define POINT_SPRITE_CORNER(pos, exportedSize, vertexId) \
+    if (g_PointSpriteScale.x != 0.0) { \
+        float spriteSize = (exportedSize) > 0.0 ? (exportedSize) : g_PointSizeDefault; \
+        uint spriteCorner = (vertexId) & 3u; \
+        float2 spriteDir = float2((spriteCorner & 1u) ? 1.0 : -1.0, \
+                                  (spriteCorner & 2u) ? -1.0 : 1.0); \
+        (pos).xy += spriteDir * spriteSize * g_PointSpriteScale * (pos).w; \
+    }
 #endif
 
 Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
 Texture3D<float4> g_Texture3DDescriptorHeap[] : register(t0, space1);
 TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space2);
 SamplerState g_SamplerDescriptorHeap[] : register(s0, space3);
+
+// A texture descriptor index carries the fetch constant's gamma components in
+// its top four bits (bit 28 + i: result component i is TextureSign kGamma).
+// The host samples those textures unconverted and the fetch applies the
+// console's piecewise-linear degamma, as the GPU does: the sRGB curve the host
+// formats offer is darker below the top quarter (0.5 decodes to 0.214 against
+// the PWL's 0.249) and over-saturated SYLPHEED's additive effects.
+#define TEXTURE_INDEX(i) ((i) & 0x0FFFFFFFu)
+
+float pwlGammaToLinear(float gamma)
+{
+    // Xenia's PWLGammaToLinear: four linear pieces in 1/1023 steps.
+    gamma = saturate(gamma);
+    float scale = gamma >= 96.0 / 255.0 ? (gamma >= 192.0 / 255.0 ? 8.0 / 1024.0 : 4.0 / 1024.0)
+                                        : (gamma >= 64.0 / 255.0 ? 2.0 / 1024.0 : 1.0 / 1024.0);
+    float offset = gamma >= 96.0 / 255.0 ? (gamma >= 192.0 / 255.0 ? -1024.0 : -256.0)
+                                         : (gamma >= 64.0 / 255.0 ? -64.0 : 0.0);
+    float value = gamma * (255.0 * 1024.0) * scale + offset;
+    value += trunc(value * scale);
+    return value * (1.0 / 1023.0);
+}
+
+float4 textureGamma(uint resourceDescriptorIndex, float4 value)
+{
+    uint mask = resourceDescriptorIndex >> 28;
+    if (mask != 0)
+    {
+        if (mask & 1u) value.x = pwlGammaToLinear(value.x);
+        if (mask & 2u) value.y = pwlGammaToLinear(value.y);
+        if (mask & 4u) value.z = pwlGammaToLinear(value.z);
+        if (mask & 8u) value.w = pwlGammaToLinear(value.w);
+    }
+    return value;
+}
 
 uint2 getTexture2DDimensions(Texture2D<float4> texture)
 {
@@ -196,13 +249,14 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
 
 float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
 {
-    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
+    Texture2D<float4> texture = g_Texture2DDescriptorHeap[TEXTURE_INDEX(resourceDescriptorIndex)];
+    return textureGamma(resourceDescriptorIndex,
+        texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture)));
 }
 
 float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
 {
-    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+    Texture2D<float4> texture = g_Texture2DDescriptorHeap[TEXTURE_INDEX(resourceDescriptorIndex)];
     return select(isnan(texCoord), 0.0, frac(texCoord * getTexture2DDimensions(texture) + offset - 0.5));
 }
 
@@ -210,7 +264,7 @@ float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, f
 // Bilinear-filtered shadow compare over the four neighboring depth texels.
 float shadowCmp2D(uint resourceDescriptorIndex, float2 texCoord, float ref)
 {
-    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+    Texture2D<float4> texture = g_Texture2DDescriptorHeap[TEXTURE_INDEX(resourceDescriptorIndex)];
     int2 dimensions = int2(getTexture2DDimensions(texture));
     float2 coord = texCoord * dimensions - 0.5;
     float2 weights = frac(coord);
@@ -268,7 +322,7 @@ float h1(float a)
 
 float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
 {
-    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+    Texture2D<float4> texture = g_Texture2DDescriptorHeap[TEXTURE_INDEX(resourceDescriptorIndex)];
     SamplerState samplerState = g_SamplerDescriptorHeap[samplerDescriptorIndex];
     uint2 dimensions = getTexture2DDimensions(texture);
     
@@ -295,12 +349,13 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
         g1(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h1y) / float2(dimensions)) +
             g1x * texture.Sample(samplerState, float2(px + h1x, py + h1y) / float2(dimensions)));
 
-    return r;
+    return textureGamma(resourceDescriptorIndex, r);
 }
 
 float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
 {
-    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
+    return textureGamma(resourceDescriptorIndex,
+        g_Texture3DDescriptorHeap[TEXTURE_INDEX(resourceDescriptorIndex)].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord));
 }
 
 struct CubeMapData
@@ -318,7 +373,8 @@ struct CubeMapData
 
 float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
 {
-    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
+    return textureGamma(resourceDescriptorIndex,
+        g_TextureCubeDescriptorHeap[TEXTURE_INDEX(resourceDescriptorIndex)].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]));
 }
 
 #ifdef REBLUE_RECOMP
@@ -402,7 +458,7 @@ float4 max4(float4 src0)
 
 float2 getPixelCoord(uint resourceDescriptorIndex, float2 texCoord)
 {
-    return getTexture2DDimensions(g_Texture2DDescriptorHeap[resourceDescriptorIndex]) * texCoord;
+    return getTexture2DDimensions(g_Texture2DDescriptorHeap[TEXTURE_INDEX(resourceDescriptorIndex)]) * texCoord;
 }
 
 float computeMipLevel(float2 pixelCoord)

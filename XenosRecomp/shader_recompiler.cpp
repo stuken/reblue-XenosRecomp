@@ -292,6 +292,29 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights)
         return;
 
+    // Vertex texture fetch (Xenos fetch slots 16-19) has no descriptor slots in
+    // the shared constants, and Sample() is pixel-stage only, so a vertex
+    // shader's fetch reads zero rather than failing to compile (Project
+    // Sylpheed's cube-mapped vertex shaders).
+    if (!isPixelShader)
+    {
+        bool anyLane = false;
+        for (size_t i = 0; i < 4; i++)
+        {
+            const auto swizzle = getDestSwizzle(instr.dstSwizzle, i);
+            anyLane |= swizzle >= FetchDestinationSwizzle::X && swizzle <= FetchDestinationSwizzle::W;
+        }
+        if (anyLane)
+        {
+            indent();
+            print("r{}.", instr.dstRegister);
+            printDstSwizzle(instr.dstSwizzle, false);
+            out += " = 0.0; // vertex texture fetch not modeled\n";
+        }
+        printDstSwizzle01(instr.dstRegister, instr.dstSwizzle);
+        return;
+    }
+
     if (instr.isPredicated)
     {
         indent();
@@ -738,8 +761,20 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
             default:
             {
                 auto findResult = interpolators.find(instr.vectorDest);
-                assert(findResult != interpolators.end());
-                exportRegister = findResult->second;
+                if (findResult != interpolators.end())
+                {
+                    exportRegister = findResult->second;
+                }
+                else
+                {
+                    // 63 is the misc vector (point size, edge flag, kill),
+                    // which the host does not model: host points are one
+                    // pixel. It, and any interpolator the shader does not
+                    // declare, lands in a scratch variable.
+                    if (instr.vectorDest != 63)
+                        fprintf(stderr, "XenosRecomp: export to undeclared interpolator o%u dropped\n", uint32_t(instr.vectorDest));
+                    exportRegister = "oMisc";
+                }
                 break;
             }
             }
@@ -1671,6 +1706,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     break;
                 }
             }
+            if (!locatedInput)
+                fprintf(stderr, "XenosRecomp: no vertex input location for usage %u index %u\n",
+                    uint32_t(vertexElement.usage), uint32_t(vertexElement.usageIndex));
             assert(locatedInput);
 
             println("in {0} i{1}{2} : {3}{2},", usageType, USAGE_VARIABLES[uint32_t(vertexElement.usage)],
@@ -1685,6 +1723,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             out += "\tin uint iVertexId : SV_VertexID,\n";
             out += "\tin uint iInstanceId : SV_InstanceID,\n";
         }
+    #endif
+    #ifdef REBLUE_RECOMP
+        // The host draws a point list as four copies of each vertex; the low
+        // two bits of the vertex id pick the corner (POINT_SPRITE_CORNER).
+        out += "\tin uint iVertexId : SV_VertexID,\n";
     #endif
 
         out += "\tout float4 oPos : SV_Position";
@@ -1900,12 +1943,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     out += "\tint aL = 0;\n";
     out += "\tbool p0 = false;\n";
     out += "\tfloat ps = 0.0;\n";
+    // The cube ALU op writes into it in either stage.
+    out += "\tCubeMapData cubeMapData = (CubeMapData)0;\n";
+    if (!isPixelShader)
+        out += "\tfloat4 oMisc = 0.0;\n";
     if (isPixelShader)
     {
 #ifdef UNLEASHED_RECOMP
         out += "\tfloat2 pixelCoord = 0.0;\n";
 #endif
-        out += "\tCubeMapData cubeMapData = (CubeMapData)0;\n";
 #ifdef REBLUE_RECOMP
         if (hasShadowTexture)
             out += "\tfloat2 shadowTapUV[8] = (float2[8])0;\n";
@@ -2462,6 +2508,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                         // to NDC while the guest viewport transform is off.
                         out += "\toPos.xy = oPos.xy * g_NdcScale + (g_NdcOffset + g_HalfPixelOffset) * oPos.w;\n";
                         out += "\tSNAP_TO_VIEWPORT_EDGES(oPos);\n";
+                        out += "\tPOINT_SPRITE_CORNER(oPos, oMisc.x, iVertexId);\n";
                     #else
                         out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
                     #endif

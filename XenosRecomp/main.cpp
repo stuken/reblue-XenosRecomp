@@ -3,6 +3,7 @@
 #include "dxc_compiler.h"
 
 #include <mutex>
+#include <stdlib.h>
 #include <vector>
 
 static std::unique_ptr<uint8_t[]> readAllBytes(const char* filePath, size_t& fileSize)
@@ -45,6 +46,12 @@ static std::vector<ShaderFailure> g_failures;
 
 int main(int argc, char** argv)
 {
+#ifdef _WIN32
+    // A failed assert prints and aborts instead of raising a dialog that
+    // nothing can dismiss under a build.
+    _set_error_mode(_OUT_TO_STDERR);
+    _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+#endif
 #ifndef XENOS_RECOMP_INPUT
     if (argc < 4)
     {
