@@ -199,6 +199,12 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
     auto findResult = vertexElements.find(address);
     assert(findResult != vertexElements.end());
 
+    // The fetch index register, for review: the input assembler can only model
+    // fetches indexed by the vertex index.
+    println("// vfetch {}{} index r{}.{}", USAGE_SEMANTICS[uint32_t(findResult->second.usage)],
+        uint32_t(findResult->second.usageIndex), uint32_t(instr.srcRegister), "xyzw"[instr.srcSwizzle & 3]);
+    indent();
+
     // Inputs are bound by semantic, so every fetch of one semantic has to read
     // the same stream data.
     {
@@ -215,29 +221,47 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
     }
 
 #ifdef REBLUE_RECOMP
+    // PGR3's tangent basis can be DEC3N as well as 11:11:10, so its shaders
+    // take both decode bits.
+#ifdef PGR3_RECOMP
+    constexpr uint32_t PACKED_NORMAL_SPEC_EXTRA = SPEC_CONSTANT_DEC3N_NORMAL;
+#else
+    constexpr uint32_t PACKED_NORMAL_SPEC_EXTRA = 0;
+#endif
     // Wrap each 16-bit-packed semantic in swapFloats() (per-usage mask); TEXCOORD also runs sintTexcoord() for raw-int bindings.
     switch (findResult->second.usage)
     {
     case DeclUsage::Normal:
-        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
+        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL | PACKED_NORMAL_SPEC_EXTRA;
         print("tfetchR11G11B10(swapFloats(g_SwappedNormals, ");
         break;
     case DeclUsage::Tangent:
-        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
+        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL | PACKED_NORMAL_SPEC_EXTRA;
         print("tfetchR11G11B10(swapFloats(g_SwappedTangents, ");
         break;
     case DeclUsage::Binormal:
-        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
+        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL | PACKED_NORMAL_SPEC_EXTRA;
         print("tfetchR11G11B10(swapFloats(g_SwappedBinormals, ");
         break;
     case DeclUsage::BlendWeight:
         print("swapFloats(g_SwappedBlendWeights, ");
         break;
     case DeclUsage::TexCoord:
+    #ifdef PGR3_RECOMP
+        print("unpackUhend3n(g_Uhend3nTexcoords, g_Hend3SignedTexcoords, g_Hend3IntegerTexcoords, "
+              "sintTexcoord(g_SintTexcoords, swapFloats(g_SwappedTexcoords, ");
+    #else
         print("sintTexcoord(g_SintTexcoords, swapFloats(g_SwappedTexcoords, ");
+    #endif
         break;
     case DeclUsage::Position:
+    #ifdef PGR3_RECOMP
+        // PGR3's SHORT4 positions are integers, not normalised: the host binds
+        // them UINT and sets bit 16 + index of the TEXCOORD sign-extension mask.
+        print("sintTexcoord(g_SintTexcoords, swapFloats(g_SwappedPositions, ");
+    #else
         print("swapFloats(g_SwappedPositions, ");
+    #endif
         break;
     }
 #else
@@ -270,11 +294,19 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
     case DeclUsage::TexCoord:
         print(", {}), {})", uint32_t(findResult->second.usageIndex),
               uint32_t(findResult->second.usageIndex));
+    #ifdef PGR3_RECOMP
+        print(", {})", uint32_t(findResult->second.usageIndex));
+    #endif
         break;
 
     case DeclUsage::BlendWeight:
+        print(", {})", uint32_t(findResult->second.usageIndex));
+        break;
     case DeclUsage::Position:
         print(", {})", uint32_t(findResult->second.usageIndex));
+    #ifdef PGR3_RECOMP
+        print(", {})", 16 + uint32_t(findResult->second.usageIndex));
+    #endif
         break;
     }
 #else

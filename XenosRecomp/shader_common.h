@@ -8,6 +8,11 @@
     #define SPEC_CONSTANT_BICUBIC_GI_FILTER (1 << 2)
     #define SPEC_CONSTANT_ALPHA_TO_COVERAGE (1 << 3)
     #define SPEC_CONSTANT_REVERSE_Z         (1 << 4)
+#else
+    // DEC3N/DEC4N tangent-basis inputs (k_2_10_10_10, signed normalised), as
+    // opposed to the 11:11:10 packing SPEC_CONSTANT_R11G11B10_NORMAL decodes.
+    // Only a PGR3_RECOMP recompiler sets it; PGR3's normals use it.
+    #define SPEC_CONSTANT_DEC3N_NORMAL      (1 << 2)
 #endif
 
 // SPIR-V vertex input locations, shared with reblue's host input-layout
@@ -94,6 +99,9 @@ struct PushConstants
 #define g_SwappedBlendWeights      vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 316)
 #define g_SwappedPositions         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 320)
 #define g_SintTexcoords            vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 324)
+#define g_Uhend3nTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 348)
+#define g_Hend3IntegerTexcoords    vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 472)
+#define g_Hend3SignedTexcoords     vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 476)
 #define g_ShadowPcfScale           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 328)
 #define g_AlphaTestFunc            vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 332)
 #define g_ClipPlaneEnable          vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 344)
@@ -137,11 +145,11 @@ struct PointSizeOutput
     uint g_SintTexcoords : packoffset(c20.y); \
     float g_ShadowPcfScale : packoffset(c20.z); \
     uint g_AlphaTestFunc : packoffset(c20.w); \
-    uint g_ClipPlaneEnable : packoffset(c21.z); \
+    uint g_ClipPlaneEnable : packoffset(c21.z);     uint g_Uhend3nTexcoords : packoffset(c21.w); \
     float4 g_ClipPlanesArr[6] : packoffset(c22); \
     float2 g_NdcScale : packoffset(c28.x); \
     float2 g_NdcOffset : packoffset(c28.z); \
-    float2 g_EdgeSnap : packoffset(c29.x);
+    float2 g_EdgeSnap : packoffset(c29.x);     uint g_Hend3IntegerTexcoords : packoffset(c29.z);     uint g_Hend3SignedTexcoords : packoffset(c29.w);
 
 #define g_ClipPlanes(i) (g_ClipPlanesArr[(i)])
 
@@ -348,9 +356,22 @@ float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, flo
 }
 
 #ifdef REBLUE_RECOMP
-// DEC3N normal decode; IA binds as R32_UINT so lane .x carries the raw bits (asuint recovers them).
+// 10:10:10:2 signed normalised (DEC3N, or DEC4N with w): x/511 per component,
+// -512 clamped to -1, and w as a 2-bit signed integer.
+float4 decodeDec3N(uint v)
+{
+    int4 c = int4(int(v << 22) >> 22, int(v << 12) >> 22, int(v << 2) >> 22, int(v) >> 30);
+    return float4(max(float3(c.xyz) / 511.0, -1.0), float(c.w));
+}
+
+// Packed tangent-basis decode; IA binds as R32_UINT so lane .x carries the
+// raw bits (asuint recovers them). SPEC_CONSTANT_R11G11B10_NORMAL is the
+// 11:11:10 packing reblue and rr6 met, SPEC_CONSTANT_DEC3N_NORMAL PGR3's
+// 10:10:10:2.
 float4 tfetchR11G11B10(float4 value)
 {
+    if (g_SpecConstants() & SPEC_CONSTANT_DEC3N_NORMAL)
+        return decodeDec3N(asuint(value.x));
     if (g_SpecConstants() & SPEC_CONSTANT_R11G11B10_NORMAL)
     {
         uint v = asuint(value.x);
@@ -367,6 +388,35 @@ float4 tfetchR11G11B10(float4 value)
 float4 swapFloats(uint swappedMask, float4 value, uint semanticIndex)
 {
     return (swappedMask & (1u << semanticIndex)) != 0 ? value.yxwz : value;
+}
+
+// 11:11:10 TEXCOORDs (k_10_11_11: x in bits 0-10, y in 11-21, z in 22-31;
+// PGR3), bound as one raw 32-bit lane. 'mask' marks the TEXCOORDs to decode,
+// 'signedMask' the signed ones and 'integerMask' those fetched as integers
+// rather than normalised (the UHEND3N/HEND3N/UHEND3/HEND3 family); the
+// callers pass g_Uhend3nTexcoords, g_Hend3SignedTexcoords and
+// g_Hend3IntegerTexcoords.
+float4 unpackUhend3n(uint mask, uint signedMask, uint integerMask, float4 value, uint semanticIndex)
+{
+    uint bit = 1u << semanticIndex;
+    if ((mask & bit) == 0)
+        return value;
+    uint v = asuint(value.x);
+    float3 c;
+    float3 scale;
+    if ((signedMask & bit) != 0)
+    {
+        c = float3(int(v << 21) >> 21, int(v << 10) >> 21, int(v) >> 22);
+        scale = float3(1023.0, 1023.0, 511.0);
+    }
+    else
+    {
+        c = float3(v & 0x7FF, (v >> 11) & 0x7FF, v >> 22);
+        scale = float3(2047.0, 2047.0, 1023.0);
+    }
+    if ((integerMask & bit) == 0)
+        c = max(c / scale, -1.0);
+    return float4(c, 1.0);
 }
 
 // Recover X360 integer-cast-to-float TEXCOORDs from R16G16(B16A16)_UINT bindings (sign-extend low 16 bits).
