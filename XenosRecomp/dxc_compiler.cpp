@@ -11,7 +11,7 @@ DxcCompiler::~DxcCompiler()
     dxcCompiler->Release();
 }
 
-IDxcBlob* DxcCompiler::compile(const std::string& shaderSource, bool compilePixelShader, bool compileLibrary, bool compileSpirv)
+IDxcBlob* DxcCompiler::compile(const std::string& shaderSource, bool compilePixelShader, bool compileLibrary, bool compileSpirv, const char* sourceName)
 {
     DxcBuffer source{};
     source.Ptr = shaderSource.c_str();
@@ -82,6 +82,8 @@ IDxcBlob* DxcCompiler::compile(const std::string& shaderSource, bool compilePixe
                 hr = result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(&errors), nullptr);
                 assert(SUCCEEDED(hr) && errors != nullptr);
 
+                if (sourceName != nullptr)
+                    fprintf(stderr, "=== %s (%s)\n", sourceName, compileSpirv ? "spirv" : "dxil");
                 fputs(errors->GetStringPointer(), stderr);
 
                 errors->Release();

@@ -24,6 +24,32 @@
     X(TexCoord,  1,  6) \
     X(TexCoord,  2,  7) \
     X(Color,     0,  8)
+#elif defined(PGR3_RECOMP)
+// Every semantic a PGR3 vertex shader declares (21 across 105 shaders, none
+// using more than 11). Locations run to 20, so Vulkan needs
+// maxVertexInputAttributes >= 21; desktop drivers report 32 or more.
+#define REBLUE_VERTEX_INPUT_LOCATIONS(X) \
+    X(Position,     0,  0) \
+    X(Position,     1,  1) \
+    X(Position,     2,  2) \
+    X(Position,     3,  3) \
+    X(BlendWeight,  0,  4) \
+    X(BlendWeight,  1,  5) \
+    X(BlendIndices, 0,  6) \
+    X(Normal,       0,  7) \
+    X(Normal,       1,  8) \
+    X(Normal,       2,  9) \
+    X(TexCoord,     0, 10) \
+    X(TexCoord,     1, 11) \
+    X(TexCoord,     2, 12) \
+    X(TexCoord,     3, 13) \
+    X(TexCoord,     4, 14) \
+    X(TexCoord,     5, 15) \
+    X(TexCoord,     6, 16) \
+    X(Tangent,      0, 17) \
+    X(Binormal,     0, 18) \
+    X(Color,        0, 19) \
+    X(Color,        1, 20)
 #else
 #define REBLUE_VERTEX_INPUT_LOCATIONS(X) \
     X(Position,  0,  0) \

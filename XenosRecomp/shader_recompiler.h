@@ -27,6 +27,10 @@ struct ShaderRecompiler : StringBuffer
     bool isPixelShader = false;
     const uint8_t* constantTableData = nullptr;
     std::unordered_map<uint32_t, VertexElement> vertexElements;
+    // (usage << 4 | usageIndex) of each declared vertex input, and the fetch
+    // parameters its first vfetch used.
+    std::unordered_set<uint32_t> declaredVertexInputs;
+    std::unordered_map<uint32_t, uint64_t> vertexInputFetches;
     std::unordered_map<uint32_t, std::string> interpolators;
     std::unordered_map<uint32_t, const ConstantInfo*> float4Constants;
     std::unordered_map<uint32_t, const char*> boolConstants;

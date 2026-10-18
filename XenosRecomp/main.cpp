@@ -37,6 +37,7 @@ struct RecompiledShader
 struct ShaderFailure
 {
     XXH64_hash_t hash;
+    std::string sourceName;
     std::string reason;
 };
 
@@ -164,10 +165,10 @@ int main(int argc, char** argv)
                 auto& shader = hashShaderPair.second;
                 const XXH64_hash_t hash = hashShaderPair.first;
 
-                auto recordFailure = [hash](const char* reason)
+                auto recordFailure = [hash, &shader](const char* reason)
                 {
                     std::lock_guard<std::mutex> lock(g_failureMutex);
-                    g_failures.push_back({hash, reason});
+                    g_failures.push_back({hash, shader.sourceName, reason});
                 };
 
                 thread_local ShaderRecompiler recompiler;
@@ -195,7 +196,7 @@ int main(int argc, char** argv)
                 thread_local DxcCompiler dxcCompiler;
 
 #ifdef XENOS_RECOMP_DXIL
-                shader.dxil = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, recompiler.specConstantsMask != 0, false);
+                shader.dxil = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, recompiler.specConstantsMask != 0, false, shader.sourceName.c_str());
                 if (shader.dxil == nullptr)
                 {
                     recordFailure("dxc-dxil-compile-failed");
@@ -208,7 +209,7 @@ int main(int argc, char** argv)
                 }
 #endif
 
-                IDxcBlob* spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true);
+                IDxcBlob* spirv = dxcCompiler.compile(recompiler.out, recompiler.isPixelShader, false, true, shader.sourceName.c_str());
                 if (spirv == nullptr)
                 {
                     recordFailure("dxc-spirv-compile-failed");
@@ -233,7 +234,7 @@ int main(int argc, char** argv)
         {
             fmt::println(stderr, "Recompile failures ({}):", g_failures.size());
             for (const auto& failure : g_failures)
-                fmt::println(stderr, "  hash=0x{:016X} reason={}", failure.hash, failure.reason);
+                fmt::println(stderr, "  hash=0x{:016X} source={} reason={}", failure.hash, failure.sourceName, failure.reason);
             return 2;
         }
 

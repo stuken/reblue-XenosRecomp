@@ -130,7 +130,12 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
     { DeclUsage::TexCoord, 14 },
     { DeclUsage::TexCoord, 15 },
     { DeclUsage::Color, 0 },
-    { DeclUsage::Color, 1 }
+    { DeclUsage::Color, 1 },
+#ifdef PGR3_RECOMP
+    // One PGR3 pair (vs_820A6980 -> ps_820A66D0) passes NORMAL0. Last, so the
+    // other interpolators keep their registers.
+    { DeclUsage::Normal, 0 },
+#endif
 };
 
 static constexpr std::string_view TEXTURE_DIMENSIONS[] = 
@@ -193,6 +198,21 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
 
     auto findResult = vertexElements.find(address);
     assert(findResult != vertexElements.end());
+
+    // Inputs are bound by semantic, so every fetch of one semantic has to read
+    // the same stream data.
+    {
+        const uint64_t fetch = uint64_t(instr.constIndex) | (uint64_t(instr.constIndexSelect) << 5) |
+            (uint64_t(instr.format) << 7) | (uint64_t(instr.numFormatAll) << 13) |
+            (uint64_t(instr.signedRfModeAll) << 14) | (uint64_t(instr.formatCompAll) << 15) |
+            (uint64_t(instr.stride) << 16) | (uint64_t(uint32_t(instr.offset) & 0x7FFFFF) << 24) |
+            (uint64_t(instr.isMiniFetch) << 47) | (uint64_t(uint32_t(instr.expAdjust) & 0x3F) << 48);
+        const uint32_t input = (uint32_t(findResult->second.usage) << 4) | findResult->second.usageIndex;
+        auto [it, first] = vertexInputFetches.emplace(input, fetch);
+        if (!first && it->second != fetch)
+            println("\n#error XenosRecomp: {}{} is fetched with different parameters at 0x{:X}",
+                USAGE_SEMANTICS[uint32_t(findResult->second.usage)], uint32_t(findResult->second.usageIndex), address);
+    }
 
 #ifdef REBLUE_RECOMP
     // Wrap each 16-bit-packed semantic in swapFloats() (per-usage mask); TEXCOORD also runs sintTexcoord() for raw-int bindings.
@@ -388,7 +408,11 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     switch (instr.dimension)
     {
     case TextureDimension::Texture1D:
-        dimension = "1D";
+        // Xenos lays a 1D texture out as a 2D one of height 1, so it is
+        // fetched as 2D at v = 0.5 and the host has to bind it as a 2D
+        // texture. (PGR3 uses this only for getWeights on a dummy sampler,
+        // which needs just the width.)
+        dimension = "2D";
         componentCount = 1;
         break;
     case TextureDimension::Texture2D:
@@ -413,10 +437,17 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
 #endif
 
     print("({0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr, dimension);
+    if (instr.dimension == TextureDimension::Texture1D)
+        out += "float2(";
     printSrcRegister(componentCount);
+    if (instr.dimension == TextureDimension::Texture1D)
+        out += ", 0.5)";
 
     switch (instr.dimension)
     {
+    case TextureDimension::Texture1D:
+        print(", float2({}, 0)", instr.offsetX * 0.5f);
+        break;
     case TextureDimension::Texture2D:
         print(", float2({}, {})", instr.offsetX * 0.5f, instr.offsetY * 0.5f);
         break;
@@ -735,6 +766,14 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
 
                 break;
 
+            case ExportRegister::VSPointSizeEdgeFlagKillVertex:
+                // x point size, y edge flag, z kill vertex. Exported only by
+                // point-sprite shaders (SQ_PROGRAM_CNTL VS export mode 2). The
+                // host has no sprite expansion of its own, so the value is
+                // kept in a local for the renderer to pick up.
+                exportRegister = "oPts";
+                break;
+
             default:
             {
                 auto findResult = interpolators.find(instr.vectorDest);
@@ -790,8 +829,11 @@ void ShaderRecompiler::recompile(const AluInstruction& instr)
         {
             scalarSnapshotRegister = instr.vectorDest;
             scalarSnapshotName = fmt::format("s{}", scalarSnapshotCount++);
+            // Declared, then assigned: inside the switch (pc) state machine a
+            // later case label may follow, and jumping past an initialised
+            // declaration is an error.
             indent();
-            println("float4 {} = r{};", scalarSnapshotName, instr.vectorDest);
+            println("float4 {}; {} = r{};", scalarSnapshotName, scalarSnapshotName, instr.vectorDest);
         }
     }
 
@@ -1336,7 +1378,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
         const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
 
-#if defined(REBLUE_RECOMP) && !defined(RR6_RECOMP)
+#if defined(REBLUE_RECOMP) && !defined(RR6_RECOMP) && !defined(PGR3_RECOMP)
         // Blue Dragon's sun-shadow PCF rewrite. RR6 also names a sampler
         // ShadowTexture, but its kernel is not BD's, so it stays untouched.
         if (isPixelShader && constantInfo->registerSet == RegisterSet::Sampler &&
@@ -1649,6 +1691,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
             value = shader.vertexElements[i];
 
+            // The table has one element per vfetch, so a semantic fetched in
+            // more than one place (PGR3 has six such shaders) is listed more
+            // than once. Declare its input once; every fetch address still
+            // maps to it, and recompile(VertexFetchInstruction) checks that
+            // the fetches agree.
+            vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
+            if (!declaredVertexInputs.insert((uint32_t(vertexElement.usage) << 4) | vertexElement.usageIndex).second)
+                continue;
+
             const char* usageType = USAGE_TYPES[uint32_t(vertexElement.usage)];
 
         #ifdef UNLEASHED_RECOMP
@@ -1671,12 +1722,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     break;
                 }
             }
-            assert(locatedInput);
+            if (!locatedInput)
+            {
+                // Without a location SPIR-V rejects the whole signature; say why.
+                println("\n#error XenosRecomp: no vertex input location for {}{}; add it to the game's *_VERTEX_INPUT_LOCATIONS table",
+                    USAGE_SEMANTICS[uint32_t(vertexElement.usage)], uint32_t(vertexElement.usageIndex));
+                out += '\t';
+            }
 
             println("in {0} i{1}{2} : {3}{2},", usageType, USAGE_VARIABLES[uint32_t(vertexElement.usage)],
                 uint32_t(vertexElement.usageIndex), USAGE_SEMANTICS[uint32_t(vertexElement.usage)]);
-
-            vertexElements.emplace(uint32_t(vertexElement.address), vertexElement);
         }
 
     #ifdef UNLEASHED_RECOMP
@@ -1868,6 +1923,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         out += "\toClipDistance1 = 1.0;\n";
     #endif
 
+        // Point size / edge flag / kill vertex export (export register 63).
+        out += "\tfloat4 oPts = 0.0;\n";
+
         for (auto& [usage, usageIndex] : INTERPOLATORS)
             println("\to{}{} = 0.0;", USAGE_VARIABLES[uint32_t(usage)], usageIndex);
 
@@ -1999,6 +2057,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
                     uint32_t(cfInstr.condJmp.address) });
                 break;
             }
+
+            case ControlFlowOpcode::CondCall:
+            case ControlFlowOpcode::Return:
+                // Subroutines are not modeled; skipping them would silently
+                // drop code, so fail the compile instead.
+                println("#error XenosRecomp: control flow {} (call/return) is not supported",
+                    cfInstr.opcode == ControlFlowOpcode::CondCall ? "cond_call" : "return");
+                break;
             }
 
             if (cfSummaries.size() == cfIndex)
