@@ -449,6 +449,16 @@ float4 swapFloats(uint swappedMask, float4 value, uint semanticIndex)
     return (swappedMask & (1u << semanticIndex)) != 0 ? value.yxwz : value;
 }
 
+#ifdef PGR3_RECOMP
+// The integer form, for BLENDINDICES (a uint4 input, or a pulled fetch's bits):
+// PGR3's minimap packs a colour index and an edge coordinate as SHORT2 there.
+// Its swap mask is bits 16 + index of g_SwappedBlendWeights.
+uint4 swapUints(uint swappedMask, uint4 value, uint semanticIndex)
+{
+    return (swappedMask & (1u << semanticIndex)) != 0 ? value.yxwz : value;
+}
+#endif
+
 // 11:11:10 TEXCOORDs (k_10_11_11: x in bits 0-10, y in 11-21, z in 22-31;
 // PGR3), bound as one raw 32-bit lane. 'mask' marks the TEXCOORDs to decode,
 // 'signedMask' the signed ones and 'integerMask' those fetched as integers

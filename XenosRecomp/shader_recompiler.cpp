@@ -290,8 +290,9 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
     #ifdef PGR3_RECOMP
     case DeclUsage::BlendIndices:
         // A uint4 input, converted to float as the input assembler hands it
-        // over; a pulled fetch returns the integer's bits.
-        print("float4(asuint(");
+        // over; a pulled fetch returns the integer's bits. 16-bit pairs get
+        // the bswap32 swap first, as for the other semantics.
+        print("float4(swapUints(g_SwappedBlendWeights, asuint(");
         break;
     #endif
     }
@@ -358,7 +359,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
         break;
     #ifdef PGR3_RECOMP
     case DeclUsage::BlendIndices:
-        out += "))";
+        print("), {}))", 16 + uint32_t(findResult->second.usageIndex));
         break;
     #endif
     }
