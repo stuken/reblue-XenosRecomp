@@ -70,6 +70,41 @@
     X(Color,     0, 10)
 #endif
 
+#ifdef PGR3_RECOMP
+// Vertex pulling. Ten PGR3 vertex shaders compute their own fetch index (per
+// instance transforms at index / N, dependent fetches through a fetched
+// index), which the input assembler cannot model, so the recompiler reads
+// every input of such a shader from the raw stream buffers (pullVertex). The
+// host describes each input location in SharedConstants as a uint2: x =
+// stream | (PULL_FORMAT_* << 8), y = byte offset in the stream's element. The
+// format codes name the host input-assembler format the declaration binds, so
+// a pulled fetch decodes exactly as the input assembler would and the usual
+// swapFloats/sintTexcoord/... wrappers apply unchanged. A stream at or above
+// PULL_MAX_STREAMS reads as zero data.
+#define PULL_MAX_STREAMS              4
+#define PULL_MAX_LOCATIONS            22
+#define PULL_FORMAT_NONE              0
+#define PULL_FORMAT_R32_FLOAT         1
+#define PULL_FORMAT_R32G32_FLOAT      2
+#define PULL_FORMAT_R32G32B32_FLOAT   3
+#define PULL_FORMAT_R32G32B32A32_FLOAT 4
+#define PULL_FORMAT_R32_UINT          5
+#define PULL_FORMAT_R32G32B32_UINT    6
+#define PULL_FORMAT_B8G8R8A8_UNORM    7
+#define PULL_FORMAT_R8G8B8A8_UNORM    8
+#define PULL_FORMAT_R8G8B8A8_UINT     9
+#define PULL_FORMAT_R16G16_SNORM      10
+#define PULL_FORMAT_R16G16B16A16_SNORM 11
+#define PULL_FORMAT_R16G16_UNORM      12
+#define PULL_FORMAT_R16G16B16A16_UNORM 13
+#define PULL_FORMAT_R16G16_SINT       14
+#define PULL_FORMAT_R16G16B16A16_SINT 15
+#define PULL_FORMAT_R16G16_UINT       16
+#define PULL_FORMAT_R16G16B16A16_UINT 17
+#define PULL_FORMAT_R16G16_FLOAT      18
+#define PULL_FORMAT_R16G16B16A16_FLOAT 19
+#endif
+
 // SPEC_CONSTANTS_ONLY keeps the HLSL below out of host C++ TUs, which IntelliSense would otherwise parse.
 #if (!defined(__cplusplus) || defined(__INTELLISENSE__)) && !defined(SHADER_COMMON_SPEC_CONSTANTS_ONLY)
 
@@ -109,6 +144,15 @@ struct PushConstants
 #define g_NdcScale                 vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 448)
 #define g_NdcOffset                vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 456)
 #define g_EdgeSnap                 vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 464)
+#ifdef PGR3_RECOMP
+// VertexIndex already includes the draw's base vertex on Vulkan.
+#define g_VertexIndexBase          0
+#define g_UintTexcoords            vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 484)
+#define g_PulledStreamSizes        vk::RawBufferLoad<uint4>(g_PushConstants.SharedConstants + 496)
+#define g_PulledStreamStrides      vk::RawBufferLoad<uint4>(g_PushConstants.SharedConstants + 512)
+#define g_PulledStreamAddress(i)   vk::RawBufferLoad<uint64_t>(g_PushConstants.SharedConstants + 528 + (i)*8)
+#define g_PulledInput(l)           vk::RawBufferLoad<uint2>(g_PushConstants.SharedConstants + 560 + (l)*8)
+#endif
 #else
 #define g_Booleans                 vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256)
 #define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
@@ -149,7 +193,22 @@ struct PointSizeOutput
     float4 g_ClipPlanesArr[6] : packoffset(c22); \
     float2 g_NdcScale : packoffset(c28.x); \
     float2 g_NdcOffset : packoffset(c28.z); \
-    float2 g_EdgeSnap : packoffset(c29.x);     uint g_Hend3IntegerTexcoords : packoffset(c29.z);     uint g_Hend3SignedTexcoords : packoffset(c29.w);
+    float2 g_EdgeSnap : packoffset(c29.x);     uint g_Hend3IntegerTexcoords : packoffset(c29.z);     uint g_Hend3SignedTexcoords : packoffset(c29.w); \
+    PGR3_SHARED_CONSTANTS()
+
+#ifdef PGR3_RECOMP
+// SV_VertexID leaves out the draw's base vertex on D3D12, so the host passes
+// it (Xenos r0.x includes it).
+#define PGR3_SHARED_CONSTANTS() \
+    int g_VertexIndexBase : packoffset(c30.x); \
+    uint g_UintTexcoords : packoffset(c30.y); \
+    uint4 g_PulledStreamSizes : packoffset(c31); \
+    uint4 g_PulledStreamStrides : packoffset(c32); \
+    uint4 g_PulledInputsArr[PULL_MAX_LOCATIONS / 2] : packoffset(c35);
+#define g_PulledInput(l) (((l) & 1) != 0 ? g_PulledInputsArr[(l) / 2].zw : g_PulledInputsArr[(l) / 2].xy)
+#else
+#define PGR3_SHARED_CONSTANTS()
+#endif
 
 #define g_ClipPlanes(i) (g_ClipPlanesArr[(i)])
 
@@ -429,6 +488,112 @@ float4 sintTexcoord(uint mask, float4 value, uint semanticIndex)
     }
     return value;
 }
+
+#ifdef PGR3_RECOMP
+// Unsigned integer TEXCOORDs (UBYTE4, UINT1), bound UINT: Xenos converts the
+// integer to float, where the input assembler hands over its bits.
+float4 uintTexcoord(uint mask, float4 value, uint semanticIndex)
+{
+    return (mask & (1u << semanticIndex)) != 0 ? float4(asuint(value)) : value;
+}
+
+// The pulled streams (see PULL_FORMAT_*): raw SRVs on D3D12, device addresses
+// on Vulkan. The host's guest buffer mirrors are already byte-swapped per
+// 32 bits, as the input assembler reads them.
+#ifdef __spirv__
+uint pulledLoad(uint stream, uint offset)
+{
+    return vk::RawBufferLoad<uint>(g_PulledStreamAddress(stream) + offset);
+}
+#else
+ByteAddressBuffer g_PulledStream0 : register(t0, space6);
+ByteAddressBuffer g_PulledStream1 : register(t1, space6);
+ByteAddressBuffer g_PulledStream2 : register(t2, space6);
+ByteAddressBuffer g_PulledStream3 : register(t3, space6);
+
+uint pulledLoad(uint stream, uint offset)
+{
+    switch (stream)
+    {
+    case 0: return g_PulledStream0.Load(offset);
+    case 1: return g_PulledStream1.Load(offset);
+    case 2: return g_PulledStream2.Load(offset);
+    default: return g_PulledStream3.Load(offset);
+    }
+}
+#endif
+
+uint pulledFormatDwords(uint format)
+{
+    switch (format)
+    {
+    case PULL_FORMAT_R32G32_FLOAT:
+    case PULL_FORMAT_R16G16B16A16_SNORM:
+    case PULL_FORMAT_R16G16B16A16_UNORM:
+    case PULL_FORMAT_R16G16B16A16_SINT:
+    case PULL_FORMAT_R16G16B16A16_UINT:
+    case PULL_FORMAT_R16G16B16A16_FLOAT:
+        return 2;
+    case PULL_FORMAT_R32G32B32_FLOAT:
+    case PULL_FORMAT_R32G32B32_UINT:
+        return 3;
+    case PULL_FORMAT_R32G32B32A32_FLOAT:
+        return 4;
+    default:
+        return 1;
+    }
+}
+
+// One input of a pulled vertex shader: what the input assembler would deliver
+// for 'desc' (g_PulledInput) at vertex 'index'. Integer formats come back as
+// their bits, as an integer binding against the float4 input does. Reads past
+// the stream's end return zero data, as the input assembler does.
+float4 pullVertex(uint2 desc, uint4 sizes, uint4 strides, float index)
+{
+    uint stream = desc.x & 0xFF;
+    uint format = desc.x >> 8;
+    uint4 raw = 0;
+    if (stream < PULL_MAX_STREAMS && format != PULL_FORMAT_NONE)
+    {
+        uint dwords = pulledFormatDwords(format);
+        uint address = uint(max(index, 0.0)) * strides[stream] + desc.y;
+        if (address + dwords * 4 <= sizes[stream])
+        {
+            raw.x = pulledLoad(stream, address);
+            if (dwords > 1) raw.y = pulledLoad(stream, address + 4);
+            if (dwords > 2) raw.z = pulledLoad(stream, address + 8);
+            if (dwords > 3) raw.w = pulledLoad(stream, address + 12);
+        }
+    }
+
+    uint4 bytes = uint4(raw.x, raw.x >> 8, raw.x >> 16, raw.x >> 24) & 0xFF;
+    int4 shorts = int4(raw.x << 16, raw.x, raw.y << 16, raw.y) >> 16;
+    uint4 ushorts = uint4(raw.x, raw.x >> 16, raw.y, raw.y >> 16) & 0xFFFF;
+    switch (format)
+    {
+    case PULL_FORMAT_R32_FLOAT: return float4(asfloat(raw.x), 0.0, 0.0, 1.0);
+    case PULL_FORMAT_R32G32_FLOAT: return float4(asfloat(raw.xy), 0.0, 1.0);
+    case PULL_FORMAT_R32G32B32_FLOAT: return float4(asfloat(raw.xyz), 1.0);
+    case PULL_FORMAT_R32G32B32A32_FLOAT: return asfloat(raw);
+    case PULL_FORMAT_R32_UINT: return asfloat(uint4(raw.x, 0, 0, 1));
+    case PULL_FORMAT_R32G32B32_UINT: return asfloat(uint4(raw.xyz, 1));
+    case PULL_FORMAT_B8G8R8A8_UNORM: return float4(bytes.zyxw) / 255.0;
+    case PULL_FORMAT_R8G8B8A8_UNORM: return float4(bytes) / 255.0;
+    case PULL_FORMAT_R8G8B8A8_UINT: return asfloat(bytes);
+    case PULL_FORMAT_R16G16_SNORM: return float4(max(float2(shorts.xy) / 32767.0, -1.0), 0.0, 1.0);
+    case PULL_FORMAT_R16G16B16A16_SNORM: return max(float4(shorts) / 32767.0, -1.0);
+    case PULL_FORMAT_R16G16_UNORM: return float4(float2(ushorts.xy) / 65535.0, 0.0, 1.0);
+    case PULL_FORMAT_R16G16B16A16_UNORM: return float4(ushorts) / 65535.0;
+    case PULL_FORMAT_R16G16_SINT: return asfloat(int4(shorts.xy, 0, 1));
+    case PULL_FORMAT_R16G16B16A16_SINT: return asfloat(shorts);
+    case PULL_FORMAT_R16G16_UINT: return asfloat(uint4(ushorts.xy, 0, 1));
+    case PULL_FORMAT_R16G16B16A16_UINT: return asfloat(ushorts);
+    case PULL_FORMAT_R16G16_FLOAT: return float4(f16tof32(ushorts.xy), 0.0, 1.0);
+    case PULL_FORMAT_R16G16B16A16_FLOAT: return f16tof32(ushorts);
+    default: return float4(0.0, 0.0, 0.0, 1.0);
+    }
+}
+#endif
 #else
 float4 tfetchR11G11B10(uint4 value)
 {

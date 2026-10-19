@@ -199,10 +199,34 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
     auto findResult = vertexElements.find(address);
     assert(findResult != vertexElements.end());
 
+    uint32_t srcRegister = instr.srcRegister;
+    uint32_t srcSwizzle = instr.srcSwizzle & 3;
+#ifdef PGR3_RECOMP
+    bool indexRounded = instr.isIndexRounded;
+    if (instr.isMiniFetch)
+    {
+        srcRegister = fullFetchSrcRegister;
+        srcSwizzle = fullFetchSrcSwizzle;
+        indexRounded = fullFetchIndexRounded;
+    }
+    else
+    {
+        fullFetchSrcRegister = srcRegister;
+        fullFetchSrcSwizzle = srcSwizzle;
+        fullFetchIndexRounded = indexRounded;
+    }
+    // Only r0.x holds the vertex index; any other index register means the
+    // input assembler cannot model this shader's fetches.
+    if (srcRegister != 0 || srcSwizzle != 0)
+        pullsVertices = true;
+    if (instr.srcRegisterAm)
+        println("\n#error XenosRecomp: relative vfetch index register at 0x{:X}", address);
+#endif
+
     // The fetch index register, for review: the input assembler can only model
     // fetches indexed by the vertex index.
     println("// vfetch {}{} index r{}.{}", USAGE_SEMANTICS[uint32_t(findResult->second.usage)],
-        uint32_t(findResult->second.usageIndex), uint32_t(instr.srcRegister), "xyzw"[instr.srcSwizzle & 3]);
+        uint32_t(findResult->second.usageIndex), srcRegister, "xyzw"[srcSwizzle]);
     indent();
 
     // Inputs are bound by semantic, so every fetch of one semantic has to read
@@ -249,7 +273,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
     case DeclUsage::TexCoord:
     #ifdef PGR3_RECOMP
         print("unpackUhend3n(g_Uhend3nTexcoords, g_Hend3SignedTexcoords, g_Hend3IntegerTexcoords, "
-              "sintTexcoord(g_SintTexcoords, swapFloats(g_SwappedTexcoords, ");
+              "uintTexcoord(g_UintTexcoords, sintTexcoord(g_SintTexcoords, swapFloats(g_SwappedTexcoords, ");
     #else
         print("sintTexcoord(g_SintTexcoords, swapFloats(g_SwappedTexcoords, ");
     #endif
@@ -263,6 +287,13 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
         print("swapFloats(g_SwappedPositions, ");
     #endif
         break;
+    #ifdef PGR3_RECOMP
+    case DeclUsage::BlendIndices:
+        // A uint4 input, converted to float as the input assembler hands it
+        // over; a pulled fetch returns the integer's bits.
+        print("float4(asuint(");
+        break;
+    #endif
     }
 #else
     switch (findResult->second.usage)
@@ -280,7 +311,23 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
     }
 #endif
 
+#ifdef PGR3_RECOMP
+    {
+        uint32_t location = ~0u;
+        for (auto& usageLocation : USAGE_LOCATIONS)
+        {
+            if (usageLocation.usage == findResult->second.usage && usageLocation.usageIndex == findResult->second.usageIndex)
+                location = usageLocation.location;
+        }
+        // The input-assembler input, its location and the Xenos fetch index
+        // (rounded or floored, as the instruction says).
+        print("VFETCH(i{}{}, {}, floor(r{}.{}{}))", USAGE_VARIABLES[uint32_t(findResult->second.usage)],
+            uint32_t(findResult->second.usageIndex), location, srcRegister, "xyzw"[srcSwizzle],
+            indexRounded ? " + 0.5" : "");
+    }
+#else
     print("i{}{}", USAGE_VARIABLES[uint32_t(findResult->second.usage)], uint32_t(findResult->second.usageIndex));
+#endif
 
 #ifdef REBLUE_RECOMP
     switch (findResult->second.usage)
@@ -295,7 +342,8 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
         print(", {}), {})", uint32_t(findResult->second.usageIndex),
               uint32_t(findResult->second.usageIndex));
     #ifdef PGR3_RECOMP
-        print(", {})", uint32_t(findResult->second.usageIndex));
+        print(", {}), {})", uint32_t(findResult->second.usageIndex),
+              uint32_t(findResult->second.usageIndex));
     #endif
         break;
 
@@ -308,6 +356,11 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
         print(", {})", 16 + uint32_t(findResult->second.usageIndex));
     #endif
         break;
+    #ifdef PGR3_RECOMP
+    case DeclUsage::BlendIndices:
+        out += "))";
+        break;
+    #endif
     }
 #else
     switch (findResult->second.usage)
@@ -1447,7 +1500,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             {
                 uint32_t tailCount = (isPixelShader ? 224 : 256) - constantInfo->registerIndex;
 
-                println("#define {}(INDEX) select((INDEX) < {}, vk::RawBufferLoad<float4>(g_PushConstants.{}ShaderConstants + ({} + min(INDEX, {})) * 16, 0x10), 0.0)",
+                // A relative index addresses the whole register file: one
+                // that leaves it reads 0 instead of memory either side.
+                println("#define {0}(INDEX) select((INDEX) >= -{3} && (INDEX) < {1}, vk::RawBufferLoad<float4>(g_PushConstants.{2}ShaderConstants + ({3} + clamp(INDEX, -{3}, {4})) * 16, 0x10), 0.0)",
                     constantName, tailCount, shaderName, constantInfo->registerIndex.get(), tailCount - 1);
             }
             else
@@ -1538,7 +1593,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             if (constantInfo->registerCount > 1)
             {
                 uint32_t tailCount = (isPixelShader ? 224 : 256) - constantInfo->registerIndex;
-                println("#define {0}(INDEX) select((INDEX) < {1}, {0}[min(INDEX, {2})], 0.0)", constantName, tailCount, tailCount - 1);
+                println("#define {0}(INDEX) select((INDEX) >= -{3} && (INDEX) < {1}, {0}[clamp(INDEX, -{3}, {2})], 0.0)",
+                    constantName, tailCount, tailCount - 1, constantInfo->registerIndex.get());
             }
         }
     }
@@ -1678,6 +1734,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     out += "#endif\n";
 
+#ifdef PGR3_RECOMP
+    vfetchDefinePos = out.size();
+#endif
     out += "void main(\n";
 
     if (isPixelShader)
@@ -1772,6 +1831,9 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             out += "\tin uint iVertexId : SV_VertexID,\n";
             out += "\tin uint iInstanceId : SV_InstanceID,\n";
         }
+    #elif defined(PGR3_RECOMP)
+        // Xenos loads the vertex index into r0.x.
+        out += "\tin uint iVertexId : SV_VertexID,\n";
     #endif
 
         out += "\tout float4 oPos : SV_Position";
@@ -1977,6 +2039,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             else if (!isPixelShader && hasIndexCount && i == 0)
             {
                 out += "float4(iVertexId + g_IndexCount.x * iInstanceId, 0.0, 0.0, 0.0);\n";
+            }
+        #elif defined(PGR3_RECOMP)
+            else if (!isPixelShader && i == 0)
+            {
+                out += "float4(float(int(iVertexId) + g_VertexIndexBase), 0.0, 0.0, 0.0);\n";
             }
         #endif
             else
@@ -2630,4 +2697,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 #endif
 
     out += "}";
+
+#ifdef PGR3_RECOMP
+    // Known only now that every fetch has been seen.
+    out.insert(vfetchDefinePos, pullsVertices
+        ? "// Pulls its vertices: a fetch index is computed, not the vertex index.\n"
+          "#define VFETCH(input, location, index) pullVertex(g_PulledInput(location), g_PulledStreamSizes, g_PulledStreamStrides, index)\n\n"
+        : "#define VFETCH(input, location, index) input\n\n");
+#endif
 }

@@ -58,6 +58,9 @@ IDxcBlob* DxcCompiler::compile(const std::string& shaderSource, bool compilePixe
     // shader_common.h selects the matching constant layout.
 #ifdef REBLUE_RECOMP
     args[argCount++] = L"-DREBLUE_RECOMP";
+#ifdef PGR3_RECOMP
+    args[argCount++] = L"-DPGR3_RECOMP";
+#endif
 #elif defined(UNLEASHED_RECOMP)
     args[argCount++] = L"-DUNLEASHED_RECOMP";
 #endif
