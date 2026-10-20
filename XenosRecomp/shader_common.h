@@ -1,6 +1,13 @@
 #ifndef SHADER_COMMON_H_INCLUDED
 #define SHADER_COMMON_H_INCLUDED
 
+// PGR3 and PGR4 share Bizarre Creations' engine (gotham3, gotham4), and with it
+// the vertex formats and fetch patterns GOTHAM_RECOMP handles. PGR3_RECOMP and
+// PGR4_RECOMP keep the per-game tables (vertex input locations, interpolators).
+#if (defined(PGR3_RECOMP) || defined(PGR4_RECOMP)) && !defined(GOTHAM_RECOMP)
+#define GOTHAM_RECOMP
+#endif
+
 #define SPEC_CONSTANT_R11G11B10_NORMAL  (1 << 0)
 #define SPEC_CONSTANT_ALPHA_TEST        (1 << 1)
 
@@ -11,7 +18,7 @@
 #else
     // DEC3N/DEC4N tangent-basis inputs (k_2_10_10_10, signed normalised), as
     // opposed to the 11:11:10 packing SPEC_CONSTANT_R11G11B10_NORMAL decodes.
-    // Only a PGR3_RECOMP recompiler sets it; PGR3's normals use it.
+    // Only a GOTHAM_RECOMP recompiler sets it; PGR3 and PGR4 normals use it.
     #define SPEC_CONSTANT_DEC3N_NORMAL      (1 << 2)
 #endif
 
@@ -55,6 +62,34 @@
     X(Binormal,     0, 18) \
     X(Color,        0, 19) \
     X(Color,        1, 20)
+#elif defined(PGR4_RECOMP)
+// Every semantic a PGR4 vertex shader declares (23 across 364 shaders, none
+// using more than 12). Locations run to 22, so Vulkan needs
+// maxVertexInputAttributes >= 23; desktop drivers report 32 or more.
+#define REBLUE_VERTEX_INPUT_LOCATIONS(X) \
+    X(Position,     0,  0) \
+    X(Position,     1,  1) \
+    X(Position,     2,  2) \
+    X(Position,     3,  3) \
+    X(Position,     4,  4) \
+    X(Position,     5,  5) \
+    X(Position,     6,  6) \
+    X(BlendWeight,  0,  7) \
+    X(BlendWeight,  1,  8) \
+    X(BlendIndices, 0,  9) \
+    X(Normal,       0, 10) \
+    X(Normal,       1, 11) \
+    X(Normal,       2, 12) \
+    X(TexCoord,     0, 13) \
+    X(TexCoord,     1, 14) \
+    X(TexCoord,     2, 15) \
+    X(TexCoord,     3, 16) \
+    X(TexCoord,     4, 17) \
+    X(TexCoord,     5, 18) \
+    X(TexCoord,     6, 19) \
+    X(Tangent,      0, 20) \
+    X(Color,        0, 21) \
+    X(Color,        1, 22)
 #else
 #define REBLUE_VERTEX_INPUT_LOCATIONS(X) \
     X(Position,  0,  0) \
@@ -70,7 +105,7 @@
     X(Color,     0, 10)
 #endif
 
-#ifdef PGR3_RECOMP
+#ifdef GOTHAM_RECOMP
 // Vertex pulling. Ten PGR3 vertex shaders compute their own fetch index (per
 // instance transforms at index / N, dependent fetches through a fetched
 // index), which the input assembler cannot model, so the recompiler reads
@@ -144,7 +179,7 @@ struct PushConstants
 #define g_NdcScale                 vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 448)
 #define g_NdcOffset                vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 456)
 #define g_EdgeSnap                 vk::RawBufferLoad<float2>(g_PushConstants.SharedConstants + 464)
-#ifdef PGR3_RECOMP
+#ifdef GOTHAM_RECOMP
 // VertexIndex already includes the draw's base vertex on Vulkan.
 #define g_VertexIndexBase          0
 #define g_UintTexcoords            vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 484)
@@ -194,12 +229,12 @@ struct PointSizeOutput
     float2 g_NdcScale : packoffset(c28.x); \
     float2 g_NdcOffset : packoffset(c28.z); \
     float2 g_EdgeSnap : packoffset(c29.x);     uint g_Hend3IntegerTexcoords : packoffset(c29.z);     uint g_Hend3SignedTexcoords : packoffset(c29.w); \
-    PGR3_SHARED_CONSTANTS()
+    GOTHAM_SHARED_CONSTANTS()
 
-#ifdef PGR3_RECOMP
+#ifdef GOTHAM_RECOMP
 // SV_VertexID leaves out the draw's base vertex on D3D12, so the host passes
 // it (Xenos r0.x includes it).
-#define PGR3_SHARED_CONSTANTS() \
+#define GOTHAM_SHARED_CONSTANTS() \
     int g_VertexIndexBase : packoffset(c30.x); \
     uint g_UintTexcoords : packoffset(c30.y); \
     uint4 g_PulledStreamSizes : packoffset(c31); \
@@ -207,7 +242,7 @@ struct PointSizeOutput
     uint4 g_PulledInputsArr[PULL_MAX_LOCATIONS / 2] : packoffset(c35);
 #define g_PulledInput(l) (((l) & 1) != 0 ? g_PulledInputsArr[(l) / 2].zw : g_PulledInputsArr[(l) / 2].xy)
 #else
-#define PGR3_SHARED_CONSTANTS()
+#define GOTHAM_SHARED_CONSTANTS()
 #endif
 
 #define g_ClipPlanes(i) (g_ClipPlanesArr[(i)])
@@ -291,6 +326,13 @@ float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float
 {
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
     return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
+}
+
+// Vertex shader fetches: no derivatives, so an explicit level.
+float4 tfetch2DLevel(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float lod)
+{
+    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+    return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), lod);
 }
 
 float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
@@ -414,6 +456,16 @@ float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, flo
     return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
 }
 
+float4 tfetch3DLevel(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float lod)
+{
+    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord, lod);
+}
+
+float4 tfetchCubeLevel(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData, float lod)
+{
+    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z], lod);
+}
+
 #ifdef REBLUE_RECOMP
 // 10:10:10:2 signed normalised (DEC3N, or DEC4N with w): x/511 per component,
 // -512 clamped to -1, and w as a 2-bit signed integer.
@@ -449,7 +501,7 @@ float4 swapFloats(uint swappedMask, float4 value, uint semanticIndex)
     return (swappedMask & (1u << semanticIndex)) != 0 ? value.yxwz : value;
 }
 
-#ifdef PGR3_RECOMP
+#ifdef GOTHAM_RECOMP
 // The integer form, for BLENDINDICES (a uint4 input, or a pulled fetch's bits):
 // PGR3's minimap packs a colour index and an edge coordinate as SHORT2 there.
 // Its swap mask is bits 16 + index of g_SwappedBlendWeights.
@@ -499,7 +551,7 @@ float4 sintTexcoord(uint mask, float4 value, uint semanticIndex)
     return value;
 }
 
-#ifdef PGR3_RECOMP
+#ifdef GOTHAM_RECOMP
 // Unsigned integer TEXCOORDs (UBYTE4, UINT1), bound UINT: Xenos converts the
 // integer to float, where the input assembler hands over its bits.
 float4 uintTexcoord(uint mask, float4 value, uint semanticIndex)

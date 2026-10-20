@@ -2,6 +2,13 @@
 
 #include "constant_table.h"
 
+// PGR3 and PGR4 share Bizarre Creations' engine (gotham3, gotham4), and with it
+// the vertex formats and fetch patterns GOTHAM_RECOMP handles. PGR3_RECOMP and
+// PGR4_RECOMP keep the per-game tables (vertex input locations, interpolators).
+#if (defined(PGR3_RECOMP) || defined(PGR4_RECOMP)) && !defined(GOTHAM_RECOMP)
+#define GOTHAM_RECOMP
+#endif
+
 struct Float4Definition
 {
     be<uint16_t> registerIndex;

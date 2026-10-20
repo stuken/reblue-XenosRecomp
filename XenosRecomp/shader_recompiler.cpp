@@ -135,6 +135,13 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
     // One PGR3 pair (vs_820A6980 -> ps_820A66D0) passes NORMAL0. Last, so the
     // other interpolators keep their registers.
     { DeclUsage::Normal, 0 },
+#elif defined(PGR4_RECOMP)
+    // PGR4 pairs pass NORMAL0 (24 vertex, 43 pixel shaders) and TANGENT0/1 (6
+    // vertex, 22 pixel shaders). Last, so the other interpolators keep their
+    // registers.
+    { DeclUsage::Normal, 0 },
+    { DeclUsage::Tangent, 0 },
+    { DeclUsage::Tangent, 1 },
 #endif
 };
 
@@ -201,7 +208,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
 
     uint32_t srcRegister = instr.srcRegister;
     uint32_t srcSwizzle = instr.srcSwizzle & 3;
-#ifdef PGR3_RECOMP
+#ifdef GOTHAM_RECOMP
     bool indexRounded = instr.isIndexRounded;
     if (instr.isMiniFetch)
     {
@@ -247,7 +254,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
 #ifdef REBLUE_RECOMP
     // PGR3's tangent basis can be DEC3N as well as 11:11:10, so its shaders
     // take both decode bits.
-#ifdef PGR3_RECOMP
+#ifdef GOTHAM_RECOMP
     constexpr uint32_t PACKED_NORMAL_SPEC_EXTRA = SPEC_CONSTANT_DEC3N_NORMAL;
 #else
     constexpr uint32_t PACKED_NORMAL_SPEC_EXTRA = 0;
@@ -271,7 +278,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
         print("swapFloats(g_SwappedBlendWeights, ");
         break;
     case DeclUsage::TexCoord:
-    #ifdef PGR3_RECOMP
+    #ifdef GOTHAM_RECOMP
         print("unpackUhend3n(g_Uhend3nTexcoords, g_Hend3SignedTexcoords, g_Hend3IntegerTexcoords, "
               "uintTexcoord(g_UintTexcoords, sintTexcoord(g_SintTexcoords, swapFloats(g_SwappedTexcoords, ");
     #else
@@ -279,7 +286,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
     #endif
         break;
     case DeclUsage::Position:
-    #ifdef PGR3_RECOMP
+    #ifdef GOTHAM_RECOMP
         // PGR3's SHORT4 positions are integers, not normalised: the host binds
         // them UINT and sets bit 16 + index of the TEXCOORD sign-extension mask.
         print("sintTexcoord(g_SintTexcoords, swapFloats(g_SwappedPositions, ");
@@ -287,7 +294,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
         print("swapFloats(g_SwappedPositions, ");
     #endif
         break;
-    #ifdef PGR3_RECOMP
+    #ifdef GOTHAM_RECOMP
     case DeclUsage::BlendIndices:
         // A uint4 input, converted to float as the input assembler hands it
         // over; a pulled fetch returns the integer's bits. 16-bit pairs get
@@ -312,7 +319,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
     }
 #endif
 
-#ifdef PGR3_RECOMP
+#ifdef GOTHAM_RECOMP
     {
         uint32_t location = ~0u;
         for (auto& usageLocation : USAGE_LOCATIONS)
@@ -342,7 +349,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
     case DeclUsage::TexCoord:
         print(", {}), {})", uint32_t(findResult->second.usageIndex),
               uint32_t(findResult->second.usageIndex));
-    #ifdef PGR3_RECOMP
+    #ifdef GOTHAM_RECOMP
         print(", {}), {})", uint32_t(findResult->second.usageIndex),
               uint32_t(findResult->second.usageIndex));
     #endif
@@ -353,11 +360,11 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
         break;
     case DeclUsage::Position:
         print(", {})", uint32_t(findResult->second.usageIndex));
-    #ifdef PGR3_RECOMP
+    #ifdef GOTHAM_RECOMP
         print(", {})", 16 + uint32_t(findResult->second.usageIndex));
     #endif
         break;
-    #ifdef PGR3_RECOMP
+    #ifdef GOTHAM_RECOMP
     case DeclUsage::BlendIndices:
         print("), {}))", 16 + uint32_t(findResult->second.usageIndex));
         break;
@@ -395,6 +402,19 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
 
 void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicubic)
 {
+    if (instr.opcode == FetchOpcode::SetTextureLod)
+    {
+        // The LOD that later fetches with useRegLod sample at.
+        usesTextureLod = true;
+        indent();
+        if (instr.isPredicated)
+            print("if ({}p0) ", instr.predCondition ? "" : "!");
+        println("textureLod = r{}.{};", instr.srcRegister, SWIZZLES[instr.srcSwizzle & 3]);
+        if (instr.srcRegisterAm)
+            println("#error XenosRecomp: SetTextureLod with a relative source register");
+        return;
+    }
+
     if (instr.opcode != FetchOpcode::TextureFetch && instr.opcode != FetchOpcode::GetTextureWeights)
         return;
 
@@ -422,7 +442,13 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     bool subtractFromOne = false;
 #endif
 
-    auto findResult = samplers.find(instr.constIndex);
+    // Xbox 360 D3D binds vertex sampler n to fetch constant 16 + n, while the
+    // constant table names it by its sampler register n (PGR4's vertex
+    // texture fetches read constants 16-19 for samplers 0-3).
+    const uint32_t samplerRegister =
+        (!isPixelShader && instr.constIndex >= 16) ? instr.constIndex - 16 : instr.constIndex;
+
+    auto findResult = samplers.find(samplerRegister);
     if (findResult != samplers.end())
     {
         constNamePtr = findResult->second;
@@ -433,7 +459,7 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     }
     else
     {
-        constName = fmt::format("s{}", instr.constIndex);
+        constName = fmt::format("s{}", samplerRegister);
         constNamePtr = constName.c_str();
     }
 
@@ -522,6 +548,14 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
         out += "Bicubic";
 #endif
 
+    // An explicit level, as Xenia does: the register LOD (SetTextureLod) when
+    // the fetch asks for it, otherwise 0 in a vertex shader, which has no
+    // derivatives; plus the instruction's LOD bias in 1/16ths.
+    const bool levelFetch = instr.opcode == FetchOpcode::TextureFetch &&
+        (!isPixelShader || instr.useRegLod);
+    if (levelFetch)
+        out += "Level";
+
     print("({0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr, dimension);
     if (instr.dimension == TextureDimension::Texture1D)
         out += "float2(";
@@ -540,6 +574,12 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     case TextureDimension::TextureCube:
         out += ", cubeMapData";
         break;
+    }
+
+    if (levelFetch)
+    {
+        usesTextureLod |= bool(instr.useRegLod);
+        print(", {}{}", instr.useRegLod ? "textureLod + " : "", instr.lodBias / 16.0f);
     }
 
     out += ").";
@@ -1464,7 +1504,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
         const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
 
-#if defined(REBLUE_RECOMP) && !defined(RR6_RECOMP) && !defined(PGR3_RECOMP)
+#if defined(REBLUE_RECOMP) && !defined(RR6_RECOMP) && !defined(GOTHAM_RECOMP)
         // Blue Dragon's sun-shadow PCF rewrite. RR6 also names a sampler
         // ShadowTexture, but its kernel is not BD's, so it stays untouched.
         if (isPixelShader && constantInfo->registerSet == RegisterSet::Sampler &&
@@ -1735,7 +1775,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     out += "#endif\n";
 
-#ifdef PGR3_RECOMP
+#ifdef GOTHAM_RECOMP
     vfetchDefinePos = out.size();
 #endif
     out += "void main(\n";
@@ -1832,7 +1872,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             out += "\tin uint iVertexId : SV_VertexID,\n";
             out += "\tin uint iInstanceId : SV_InstanceID,\n";
         }
-    #elif defined(PGR3_RECOMP)
+    #elif defined(GOTHAM_RECOMP)
         // Xenos loads the vertex index into r0.x.
         out += "\tin uint iVertexId : SV_VertexID,\n";
     #endif
@@ -2041,7 +2081,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             {
                 out += "float4(iVertexId + g_IndexCount.x * iInstanceId, 0.0, 0.0, 0.0);\n";
             }
-        #elif defined(PGR3_RECOMP)
+        #elif defined(GOTHAM_RECOMP)
             else if (!isPixelShader && i == 0)
             {
                 out += "float4(float(int(iVertexId) + g_VertexIndexBase), 0.0, 0.0, 0.0);\n";
@@ -2058,6 +2098,7 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
     out += "\tint aL = 0;\n";
     out += "\tbool p0 = false;\n";
     out += "\tfloat ps = 0.0;\n";
+    textureLodDeclPos = out.size();
     if (isPixelShader)
     {
 #ifdef UNLEASHED_RECOMP
@@ -2699,7 +2740,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
     out += "}";
 
-#ifdef PGR3_RECOMP
+    // Declared only where used, so other shaders' HLSL is unchanged. Inserted
+    // before the VFETCH define, which sits earlier in the output.
+    if (usesTextureLod)
+        out.insert(textureLodDeclPos, "\tfloat textureLod = 0.0;\n");
+
+#ifdef GOTHAM_RECOMP
     // Known only now that every fetch has been seen.
     out.insert(vfetchDefinePos, pullsVertices
         ? "// Pulls its vertices: a fetch index is computed, not the vertex index.\n"

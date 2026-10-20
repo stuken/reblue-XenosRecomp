@@ -61,6 +61,9 @@ IDxcBlob* DxcCompiler::compile(const std::string& shaderSource, bool compilePixe
 #ifdef PGR3_RECOMP
     args[argCount++] = L"-DPGR3_RECOMP";
 #endif
+#ifdef PGR4_RECOMP
+    args[argCount++] = L"-DPGR4_RECOMP";
+#endif
 #elif defined(UNLEASHED_RECOMP)
     args[argCount++] = L"-DUNLEASHED_RECOMP";
 #endif
