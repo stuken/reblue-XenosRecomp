@@ -145,7 +145,13 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
 #endif
 };
 
-static constexpr std::string_view TEXTURE_DIMENSIONS[] = 
+#ifdef PGR4_RECOMP
+// Where SharedConstants keeps the vertex samplers' descriptor indices (bytes
+// 736-799, c46-c49): the host's SharedConstants::vertexTexture2DIndices.
+static constexpr uint32_t VERTEX_SAMPLER_INDICES_OFFSET = 736;
+#endif
+
+static constexpr std::string_view TEXTURE_DIMENSIONS[] =
 {
     "2D",
     "3D", 
@@ -1571,6 +1577,25 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
         case RegisterSet::Sampler:
         {
+#ifdef PGR4_RECOMP
+            // Vertex samplers 0-3 (the device's sampler slots 16-19) have their
+            // own descriptor indices after the shared block's other fields,
+            // one float4 per dimension and one for the samplers.
+            if (!isPixelShader)
+            {
+                for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+                {
+                    println("#define {}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+                        constantName, TEXTURE_DIMENSIONS[j], VERTEX_SAMPLER_INDICES_OFFSET + j * 16 + constantInfo->registerIndex * 4);
+                }
+
+                println("#define {}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+                    constantName, VERTEX_SAMPLER_INDICES_OFFSET + std::size(TEXTURE_DIMENSIONS) * 16 + constantInfo->registerIndex * 4);
+
+                samplers.emplace(constantInfo->registerIndex, constantName);
+                break;
+            }
+#endif
             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
             {
                 println("#define {}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
@@ -1654,6 +1679,21 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         {
             const char* constantName = reinterpret_cast<const char*>(constantTableData + constantInfo->name);
 
+#ifdef PGR4_RECOMP
+            if (!isPixelShader)
+            {
+                constexpr uint32_t base = VERTEX_SAMPLER_INDICES_OFFSET / 16;
+                for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+                {
+                    println("\tuint {}_Texture{}DescriptorIndex : packoffset(c{}.{});",
+                        constantName, TEXTURE_DIMENSIONS[j], base + j, SWIZZLES[constantInfo->registerIndex % 4]);
+                }
+
+                println("\tuint {}_SamplerDescriptorIndex : packoffset(c{}.{});",
+                    constantName, base + std::size(TEXTURE_DIMENSIONS), SWIZZLES[constantInfo->registerIndex % 4]);
+                continue;
+            }
+#endif
             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
             {
                 println("\tuint {}_Texture{}DescriptorIndex : packoffset(c{}.{});",
