@@ -568,6 +568,13 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
         instr.dimension != TextureDimension::Texture1D;
     if (biasFetch)
         levelFetch = false;
+    // With neither, the level is explicit too: the instruction's (and the
+    // fetch constant's) bias alone, as in Xenia. PGR4's metallic car paint
+    // looks its colour up so in a 3x512 table whose sampler minifies with
+    // point filtering, which a computed LOD above 0 selected.
+    if (instr.opcode == FetchOpcode::TextureFetch && isPixelShader &&
+        !instr.useCompLod && !instr.useRegLod)
+        levelFetch = true;
 #endif
     if (levelFetch)
         out += "Level";
