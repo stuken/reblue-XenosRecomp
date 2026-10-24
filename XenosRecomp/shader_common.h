@@ -335,6 +335,15 @@ float4 tfetch2DLevel(uint resourceDescriptorIndex, uint samplerDescriptorIndex, 
     return texture.SampleLevel(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), lod);
 }
 
+// Pixel shader fetches with both the computed and the register LOD: the
+// register LOD biases the computed one (Xenia folds it into the gradients),
+// on top of the sampler's (fetch constant's) bias.
+float4 tfetch2DBias(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset, float bias)
+{
+    Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+    return texture.SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), bias);
+}
+
 float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
 {
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
@@ -454,6 +463,16 @@ struct CubeMapData
 float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
 {
     return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
+}
+
+float4 tfetch3DBias(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float bias)
+{
+    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord, bias);
+}
+
+float4 tfetchCubeBias(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData, float bias)
+{
+    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z], bias);
 }
 
 float4 tfetch3DLevel(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, float lod)

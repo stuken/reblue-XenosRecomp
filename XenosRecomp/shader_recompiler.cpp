@@ -557,10 +557,22 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     // An explicit level, as Xenia does: the register LOD (SetTextureLod) when
     // the fetch asks for it, otherwise 0 in a vertex shader, which has no
     // derivatives; plus the instruction's LOD bias in 1/16ths.
-    const bool levelFetch = instr.opcode == FetchOpcode::TextureFetch &&
+    bool levelFetch = instr.opcode == FetchOpcode::TextureFetch &&
         (!isPixelShader || instr.useRegLod);
+    // With the computed LOD as well, the register LOD is a bias on it, as
+    // Xenia applies it: PGR4's road shaders fetch their base maps so, with the
+    // register LOD at 0 and the fetch constant's bias doing the work.
+    bool biasFetch = false;
+#ifdef PGR4_RECOMP
+    biasFetch = levelFetch && isPixelShader && instr.useCompLod &&
+        instr.dimension != TextureDimension::Texture1D;
+    if (biasFetch)
+        levelFetch = false;
+#endif
     if (levelFetch)
         out += "Level";
+    if (biasFetch)
+        out += "Bias";
 
     print("({0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr, dimension);
     if (instr.dimension == TextureDimension::Texture1D)
@@ -582,7 +594,7 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
         break;
     }
 
-    if (levelFetch)
+    if (levelFetch || biasFetch)
     {
         usesTextureLod |= bool(instr.useRegLod);
         print(", {}{}", instr.useRegLod ? "textureLod + " : "", instr.lodBias / 16.0f);
