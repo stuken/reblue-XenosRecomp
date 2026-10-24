@@ -149,6 +149,43 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
 // Where SharedConstants keeps the vertex samplers' descriptor indices (bytes
 // 736-799, c46-c49): the host's SharedConstants::vertexTexture2DIndices.
 static constexpr uint32_t VERTEX_SAMPLER_INDICES_OFFSET = 736;
+// Each sampler slot's fetch constant LOD bias, as a float: pixel samplers 0-15
+// at bytes 800-863 (c50-c53), vertex samplers 0-3 at 864-879 (c54). The host's
+// SharedConstants::samplerLodBiases and vertexSamplerLodBiases.
+static constexpr uint32_t SAMPLER_LOD_BIASES_OFFSET = 800;
+static constexpr uint32_t VERTEX_SAMPLER_LOD_BIASES_OFFSET = 864;
+// The pixel samplers' variant descriptor indices (SAMPLER_VARIANT_*), 16 per
+// variant from SAMPLER_VARIANT_NO_ANISO: bytes 880-1135 (c55-c70), the host's
+// SharedConstants::samplerVariantIndices.
+static constexpr uint32_t SAMPLER_VARIANT_INDICES_OFFSET = 880;
+
+// Xenos' instruction filter fields: 3 (mag, min, mip) and 7 (anisotropy)
+// defer to the fetch constant.
+static constexpr uint32_t FILTER_USE_FETCH_CONST = 3;
+static constexpr uint32_t ANISO_USE_FETCH_CONST = 7;
+
+// The sampler variant a fetch's filter overrides select, or -1 for a
+// combination SAMPLER_VARIANT_* does not cover.
+static int samplerVariant(const TextureFetchInstruction& instr)
+{
+    const bool fcMagMin = instr.magFilter == FILTER_USE_FETCH_CONST && instr.minFilter == FILTER_USE_FETCH_CONST;
+    const bool fcMip = instr.mipFilter == FILTER_USE_FETCH_CONST;
+    const bool fcAniso = instr.anisoFilter == ANISO_USE_FETCH_CONST;
+    const bool pointMagMin = instr.magFilter == 0 && instr.minFilter == 0;
+    const bool linearMagMin = instr.magFilter == 1 && instr.minFilter == 1;
+    if (fcMagMin && fcMip && fcAniso)
+        return SAMPLER_VARIANT_NONE;
+    if (fcMagMin && fcMip && instr.anisoFilter == 0)
+        return SAMPLER_VARIANT_NO_ANISO;
+    // Point filtering leaves anisotropy nothing to do.
+    if (pointMagMin && fcMip)
+        return SAMPLER_VARIANT_POINT;
+    if (pointMagMin && instr.mipFilter == 0)
+        return SAMPLER_VARIANT_POINT_MIP_POINT;
+    if (linearMagMin && fcMip && fcAniso)
+        return SAMPLER_VARIANT_LINEAR;
+    return -1;
+}
 #endif
 
 static constexpr std::string_view TEXTURE_DIMENSIONS[] =
@@ -575,13 +612,39 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     if (instr.opcode == FetchOpcode::TextureFetch && isPixelShader &&
         !instr.useCompLod && !instr.useRegLod)
         levelFetch = true;
+    // The rest take the computed LOD, biased too: every fetch adds the fetch
+    // constant's LOD bias (the sampler slot's _LodBias) in the shader, as
+    // Xenia does, and the host's samplers carry none. D3D12 leaves a
+    // sampler's MipLODBias off SampleLevel where Vulkan applies it, so only
+    // this way do explicit levels get the bias, and on both backends alike.
+    if (instr.opcode == FetchOpcode::TextureFetch && !levelFetch)
+        biasFetch = true;
 #endif
     if (levelFetch)
         out += "Level";
     if (biasFetch)
         out += "Bias";
 
-    print("({0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex, ", constNamePtr, dimension);
+    // A filter override reads its variant's sampler (pixel shaders; no PGR4
+    // vertex fetch overrides the fetch constant).
+    std::string samplerSuffix;
+#ifdef PGR4_RECOMP
+    if (instr.opcode == FetchOpcode::TextureFetch)
+    {
+        const int variant = samplerVariant(instr);
+        if (variant < 0 || (variant != SAMPLER_VARIANT_NONE && !isPixelShader))
+        {
+            println("\n#error XenosRecomp: texture fetch filter override mag={} min={} mip={} aniso={} ({} shader) has no sampler variant",
+                uint32_t(instr.magFilter), uint32_t(instr.minFilter), uint32_t(instr.mipFilter),
+                uint32_t(instr.anisoFilter), isPixelShader ? "pixel" : "vertex");
+        }
+        else if (variant != SAMPLER_VARIANT_NONE)
+        {
+            samplerSuffix = std::to_string(variant);
+        }
+    }
+#endif
+    print("({0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex{2}, ", constNamePtr, dimension, samplerSuffix);
     if (instr.dimension == TextureDimension::Texture1D)
         out += "float2(";
     printSrcRegister(componentCount);
@@ -605,6 +668,9 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     {
         usesTextureLod |= bool(instr.useRegLod);
         print(", {}{}", instr.useRegLod ? "textureLod + " : "", instr.lodBias / 16.0f);
+#ifdef PGR4_RECOMP
+        print(" + {}_LodBias", constNamePtr);
+#endif
     }
 
     out += ").";
@@ -1610,6 +1676,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
                 println("#define {}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
                     constantName, VERTEX_SAMPLER_INDICES_OFFSET + std::size(TEXTURE_DIMENSIONS) * 16 + constantInfo->registerIndex * 4);
+                println("#define {}_LodBias vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + {})",
+                    constantName, VERTEX_SAMPLER_LOD_BIASES_OFFSET + constantInfo->registerIndex * 4);
 
                 samplers.emplace(constantInfo->registerIndex, constantName);
                 break;
@@ -1623,6 +1691,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
             println("#define {}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
                 constantName, std::size(TEXTURE_DIMENSIONS) * 64 + constantInfo->registerIndex * 4);
+#ifdef PGR4_RECOMP
+            println("#define {}_LodBias vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + {})",
+                constantName, SAMPLER_LOD_BIASES_OFFSET + constantInfo->registerIndex * 4);
+            for (uint32_t v = 1; v < SAMPLER_VARIANT_COUNT; v++)
+            {
+                println("#define {}_SamplerDescriptorIndex{} vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+                    constantName, v, SAMPLER_VARIANT_INDICES_OFFSET + (v - 1) * 64 + constantInfo->registerIndex * 4);
+            }
+#endif
 
             samplers.emplace(constantInfo->registerIndex, constantName);
             break;
@@ -1644,6 +1721,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         }
         println("#define s{}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
             r, std::size(TEXTURE_DIMENSIONS) * 64 + r * 4);
+#ifdef PGR4_RECOMP
+        println("#define s{}_LodBias vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + {})",
+            r, SAMPLER_LOD_BIASES_OFFSET + r * 4);
+        for (uint32_t v = 1; v < SAMPLER_VARIANT_COUNT; v++)
+        {
+            println("#define s{}_SamplerDescriptorIndex{} vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+                r, v, SAMPLER_VARIANT_INDICES_OFFSET + (v - 1) * 64 + r * 4);
+        }
+#endif
     }
 #endif
 
@@ -1710,6 +1796,8 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
                 println("\tuint {}_SamplerDescriptorIndex : packoffset(c{}.{});",
                     constantName, base + std::size(TEXTURE_DIMENSIONS), SWIZZLES[constantInfo->registerIndex % 4]);
+                println("\tfloat {}_LodBias : packoffset(c{}.{});",
+                    constantName, VERTEX_SAMPLER_LOD_BIASES_OFFSET / 16, SWIZZLES[constantInfo->registerIndex % 4]);
                 continue;
             }
 #endif
@@ -1721,6 +1809,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
 
             println("\tuint {}_SamplerDescriptorIndex : packoffset(c{}.{});",
                 constantName, 4 * std::size(TEXTURE_DIMENSIONS) + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
+#ifdef PGR4_RECOMP
+            println("\tfloat {}_LodBias : packoffset(c{}.{});",
+                constantName, SAMPLER_LOD_BIASES_OFFSET / 16 + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
+            for (uint32_t v = 1; v < SAMPLER_VARIANT_COUNT; v++)
+            {
+                println("\tuint {}_SamplerDescriptorIndex{} : packoffset(c{}.{});",
+                    constantName, v, SAMPLER_VARIANT_INDICES_OFFSET / 16 + (v - 1) * 4 + constantInfo->registerIndex / 4,
+                    SWIZZLES[constantInfo->registerIndex % 4]);
+            }
+#endif
         }
     }
 
@@ -1737,6 +1835,15 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
         }
         println("\tuint s{}_SamplerDescriptorIndex : packoffset(c{}.{});",
             r, 4 * std::size(TEXTURE_DIMENSIONS) + r / 4, SWIZZLES[r % 4]);
+#ifdef PGR4_RECOMP
+        println("\tfloat s{}_LodBias : packoffset(c{}.{});",
+            r, SAMPLER_LOD_BIASES_OFFSET / 16 + r / 4, SWIZZLES[r % 4]);
+        for (uint32_t v = 1; v < SAMPLER_VARIANT_COUNT; v++)
+        {
+            println("\tuint s{}_SamplerDescriptorIndex{} : packoffset(c{}.{});",
+                r, v, SAMPLER_VARIANT_INDICES_OFFSET / 16 + (v - 1) * 4 + r / 4, SWIZZLES[r % 4]);
+        }
+#endif
     }
 #endif
 

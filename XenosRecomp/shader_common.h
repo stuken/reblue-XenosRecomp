@@ -26,6 +26,22 @@
     #define SPEC_CONSTANT_CLAMP_7E3         (1 << 3)
 #endif
 
+#ifdef PGR4_RECOMP
+// Sampler variants for texture fetches whose instruction overrides the fetch
+// constant's filtering (Xenos takes the instruction's filter where it is not
+// "use the fetch constant"). Per pixel sampler slot the host builds each
+// variant of the fetch constant's sampler and passes its descriptor index in
+// SharedConstants; a fetch with an override reads its variant's index. PGR4's
+// scene and road shaders turn anisotropy off for their secondary maps, the
+// crowd sprites and the shadow blurs choose point or linear filtering.
+#define SAMPLER_VARIANT_NONE            0 // the fetch constant's filtering
+#define SAMPLER_VARIANT_NO_ANISO        1 // anisotropy off
+#define SAMPLER_VARIANT_POINT           2 // point mag/min, the fetch constant's mip filter, no anisotropy
+#define SAMPLER_VARIANT_POINT_MIP_POINT 3 // point mag/min/mip, no anisotropy
+#define SAMPLER_VARIANT_LINEAR          4 // linear mag/min, the fetch constant's mip filter and anisotropy
+#define SAMPLER_VARIANT_COUNT           5
+#endif
+
 // SPIR-V vertex input locations, shared with reblue's host input-layout
 // builder. A semantic missing here gets no location from the emitter.
 #ifdef RR6_RECOMP
