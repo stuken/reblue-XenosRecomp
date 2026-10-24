@@ -2682,6 +2682,14 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
             {
                 if (isPixelShader)
                 {
+#ifdef PGR4_RECOMP
+                    specConstantsMask |= SPEC_CONSTANT_CLAMP_7E3;
+
+                    indent();
+                    out += "[branch] if (g_SpecConstants() & SPEC_CONSTANT_CLAMP_7E3)\n";
+                    indent();
+                    out += "\toC0 = clamp7e3(oC0);\n";
+#endif
                     specConstantsMask |= SPEC_CONSTANT_ALPHA_TEST;
 
                     indent();

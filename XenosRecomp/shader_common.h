@@ -20,6 +20,10 @@
     // opposed to the 11:11:10 packing SPEC_CONSTANT_R11G11B10_NORMAL decodes.
     // Only a GOTHAM_RECOMP recompiler sets it; PGR3 and PGR4 normals use it.
     #define SPEC_CONSTANT_DEC3N_NORMAL      (1 << 2)
+    // The render target is Xenos' 7e3 EDRAM format, which cannot hold NaN,
+    // infinity or values above 31.875: the pixel shader's colour is clamped
+    // as the conversion to it does (PGR4_RECOMP pixel shaders).
+    #define SPEC_CONSTANT_CLAMP_7E3         (1 << 3)
 #endif
 
 // SPIR-V vertex input locations, shared with reblue's host input-layout
@@ -320,6 +324,14 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
     uint2 dimensions;
     texture.GetDimensions(dimensions.x, dimensions.y);
     return dimensions;
+}
+
+// SPEC_CONSTANT_CLAMP_7E3: NaN to 0, colour into 7e3's [0, 31.875], alpha
+// (two bits) into [0, 1].
+float4 clamp7e3(float4 c)
+{
+    c = select(isnan(c), 0.0, c);
+    return float4(clamp(c.rgb, 0.0, 31.875), saturate(c.a));
 }
 
 float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
