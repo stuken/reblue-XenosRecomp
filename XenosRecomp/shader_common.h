@@ -387,10 +387,15 @@ float4 tfetch2DBias(uint resourceDescriptorIndex, uint samplerDescriptorIndex, f
     return texture.SampleBias(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture), bias);
 }
 
+// The texture unit's weights are fixed point, so never NaN. A coordinate that
+// overflows once scaled gives frac(inf) = NaN here: PGR4's skinned shaders
+// project shadows by 1 / TEXCOORD5.w, which a rider's "no shadow" matrix
+// leaves 0 (clamped to FLT_MAX), and the NaN weights turned the rider black.
 float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
 {
     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
-    return select(isnan(texCoord), 0.0, frac(texCoord * getTexture2DDimensions(texture) + offset - 0.5));
+    float2 weights = frac(texCoord * getTexture2DDimensions(texture) + offset - 0.5);
+    return select(isnan(weights), 0.0, weights);
 }
 
 #ifdef REBLUE_RECOMP
