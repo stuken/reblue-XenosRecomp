@@ -645,11 +645,21 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     }
 #endif
     print("({0}_Texture{1}DescriptorIndex, {0}_SamplerDescriptorIndex{2}, ", constNamePtr, dimension, samplerSuffix);
+    // Unnormalized coordinates address texels: scaled by the texture's size,
+    // as Xenia does (not for cubes, whose coordinates are directions).
+    bool denorm = false;
+#ifdef PGR4_RECOMP
+    denorm = instr.texCoordDenorm && instr.dimension != TextureDimension::TextureCube;
+    if (denorm)
+        print("denormTexCoord{0}({1}_Texture{0}DescriptorIndex, ", dimension, constNamePtr);
+#endif
     if (instr.dimension == TextureDimension::Texture1D)
         out += "float2(";
     printSrcRegister(componentCount);
     if (instr.dimension == TextureDimension::Texture1D)
         out += ", 0.5)";
+    if (denorm)
+        out += ")";
 
     switch (instr.dimension)
     {

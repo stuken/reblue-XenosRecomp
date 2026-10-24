@@ -342,6 +342,21 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
     return dimensions;
 }
 
+// A fetch with unnormalized coordinates (the instruction's texCoordDenorm
+// bit) addresses texels, as Xenia scales them: PGR4's skinned vertex shaders
+// fetch their bone palette (156x1, 3 texels a bone) at 3 * index + 0.5.
+float2 denormTexCoord2D(uint resourceDescriptorIndex, float2 texCoord)
+{
+    return texCoord / float2(getTexture2DDimensions(g_Texture2DDescriptorHeap[resourceDescriptorIndex]));
+}
+
+float3 denormTexCoord3D(uint resourceDescriptorIndex, float3 texCoord)
+{
+    uint3 dimensions;
+    g_Texture3DDescriptorHeap[resourceDescriptorIndex].GetDimensions(dimensions.x, dimensions.y, dimensions.z);
+    return texCoord / float3(dimensions);
+}
+
 // SPEC_CONSTANT_CLAMP_7E3: NaN to 0, colour into 7e3's [0, 31.875], alpha
 // (two bits) into [0, 1].
 float4 clamp7e3(float4 c)
