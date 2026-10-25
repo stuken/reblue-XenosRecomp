@@ -54,6 +54,10 @@ struct ShaderRecompiler : StringBuffer
     // emitted (then-branch close is part of the event, not ifEndLabels).
     std::unordered_set<uint32_t> elseLabels;
     uint32_t specConstantsMask = 0;
+    // The host's texture slots the shader fetches through: bit n for pixel
+    // sampler n, bit 16 + n for vertex sampler n (PGR4_RECOMP emits it into
+    // the cache entry, so the host binds only these).
+    uint32_t samplerSlotMask = 0;
     // Names the snapshots taken for co-issued scalar ops (see recompile(AluInstruction)).
     uint32_t scalarSnapshotCount = 0;
 

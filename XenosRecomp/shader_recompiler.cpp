@@ -491,6 +491,13 @@ void ShaderRecompiler::recompile(const TextureFetchInstruction& instr, bool bicu
     const uint32_t samplerRegister =
         (!isPixelShader && instr.constIndex >= 16) ? instr.constIndex - 16 : instr.constIndex;
 
+    // Pixel samplers are host slots 0-15 and vertex samplers 16-19. A sampler
+    // outside them marks every slot, so the host never skips one it reads.
+    if (isPixelShader ? samplerRegister < 16 : samplerRegister < 4)
+        samplerSlotMask |= 1u << (isPixelShader ? samplerRegister : 16 + samplerRegister);
+    else
+        samplerSlotMask |= 0xFFFFF;
+
     auto findResult = samplers.find(samplerRegister);
     if (findResult != samplers.end())
     {

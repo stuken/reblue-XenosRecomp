@@ -30,6 +30,7 @@ struct RecompiledShader
     IDxcBlob* dxil = nullptr;
     std::vector<uint8_t> spirv;
     uint32_t specConstantsMask = 0;
+    uint32_t samplerSlotMask = 0;
     std::string sourceName;
 };
 
@@ -176,6 +177,7 @@ int main(int argc, char** argv)
                 recompiler.recompile(shader.data, include);
 
                 shader.specConstantsMask = recompiler.specConstantsMask;
+                shader.samplerSlotMask = recompiler.samplerSlotMask;
 
                 if (!hlslDumpDir.empty())
                 {
@@ -253,8 +255,14 @@ int main(int argc, char** argv)
 
         for (auto& [hash, shader] : shaders)
         {
+#ifdef PGR4_RECOMP
+            f.println("\t{{ 0x{:X}, {}, {}, {}, {}, {}, 0x{:X} }},",
+                hash, dxil.size(), (shader.dxil != nullptr) ? shader.dxil->GetBufferSize() : 0, spirv.size(), shader.spirv.size(), shader.specConstantsMask,
+                shader.samplerSlotMask);
+#else
             f.println("\t{{ 0x{:X}, {}, {}, {}, {}, {} }},",
                 hash, dxil.size(), (shader.dxil != nullptr) ? shader.dxil->GetBufferSize() : 0, spirv.size(), shader.spirv.size(), shader.specConstantsMask);
+#endif
 
             if (shader.dxil != nullptr)
             {
