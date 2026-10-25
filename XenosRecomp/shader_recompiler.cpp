@@ -295,28 +295,35 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
     }
 
 #ifdef REBLUE_RECOMP
-    // PGR3's tangent basis can be DEC3N as well as 11:11:10, so its shaders
-    // take both decode bits.
-#ifdef GOTHAM_RECOMP
-    constexpr uint32_t PACKED_NORMAL_SPEC_EXTRA = SPEC_CONSTANT_DEC3N_NORMAL;
-#else
-    constexpr uint32_t PACKED_NORMAL_SPEC_EXTRA = 0;
-#endif
     // Wrap each 16-bit-packed semantic in swapFloats() (per-usage mask); TEXCOORD also runs sintTexcoord() for raw-int bindings.
     switch (findResult->second.usage)
     {
+#ifdef GOTHAM_RECOMP
+    // The packing comes per element from the host's masks, not the spec
+    // constants (tfetchPackedBasis).
     case DeclUsage::Normal:
-        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL | PACKED_NORMAL_SPEC_EXTRA;
+        print("tfetchPackedBasis(g_Dec3NBasis, g_R11G11B10Basis, swapFloats(g_SwappedNormals, ");
+        break;
+    case DeclUsage::Tangent:
+        print("tfetchPackedBasis(g_Dec3NBasis, g_R11G11B10Basis, swapFloats(g_SwappedTangents, ");
+        break;
+    case DeclUsage::Binormal:
+        print("tfetchPackedBasis(g_Dec3NBasis, g_R11G11B10Basis, swapFloats(g_SwappedBinormals, ");
+        break;
+#else
+    case DeclUsage::Normal:
+        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
         print("tfetchR11G11B10(swapFloats(g_SwappedNormals, ");
         break;
     case DeclUsage::Tangent:
-        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL | PACKED_NORMAL_SPEC_EXTRA;
+        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
         print("tfetchR11G11B10(swapFloats(g_SwappedTangents, ");
         break;
     case DeclUsage::Binormal:
-        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL | PACKED_NORMAL_SPEC_EXTRA;
+        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
         print("tfetchR11G11B10(swapFloats(g_SwappedBinormals, ");
         break;
+#endif
     case DeclUsage::BlendWeight:
         print("swapFloats(g_SwappedBlendWeights, ");
         break;
@@ -386,7 +393,15 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
     case DeclUsage::Normal:
     case DeclUsage::Tangent:
     case DeclUsage::Binormal:
+    #ifdef GOTHAM_RECOMP
+        print(", {}), {})", uint32_t(findResult->second.usageIndex),
+              8 * (findResult->second.usage == DeclUsage::Normal    ? 0u
+                   : findResult->second.usage == DeclUsage::Tangent ? 1u
+                                                                    : 2u) +
+                  uint32_t(findResult->second.usageIndex));
+    #else
         print(", {}))", uint32_t(findResult->second.usageIndex));
+    #endif
         break;
 
     case DeclUsage::TexCoord:

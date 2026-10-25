@@ -203,6 +203,8 @@ struct PushConstants
 // VertexIndex already includes the draw's base vertex on Vulkan.
 #define g_VertexIndexBase          0
 #define g_UintTexcoords            vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 484)
+#define g_Dec3NBasis               vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 488)
+#define g_R11G11B10Basis           vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 492)
 #define g_PulledStreamSizes        vk::RawBufferLoad<uint4>(g_PushConstants.SharedConstants + 496)
 #define g_PulledStreamStrides      vk::RawBufferLoad<uint4>(g_PushConstants.SharedConstants + 512)
 #define g_PulledStreamAddress(i)   vk::RawBufferLoad<uint64_t>(g_PushConstants.SharedConstants + 528 + (i)*8)
@@ -256,7 +258,7 @@ struct PointSizeOutput
 // it (Xenos r0.x includes it).
 #define GOTHAM_SHARED_CONSTANTS() \
     int g_VertexIndexBase : packoffset(c30.x); \
-    uint g_UintTexcoords : packoffset(c30.y); \
+    uint g_UintTexcoords : packoffset(c30.y);     uint g_Dec3NBasis : packoffset(c30.z);     uint g_R11G11B10Basis : packoffset(c30.w); \
     uint4 g_PulledStreamSizes : packoffset(c31); \
     uint4 g_PulledStreamStrides : packoffset(c32); \
     uint4 g_PulledInputsArr[PULL_MAX_LOCATIONS / 2] : packoffset(c35);
@@ -575,6 +577,27 @@ float4 swapFloats(uint swappedMask, float4 value, uint semanticIndex)
 uint4 swapUints(uint swappedMask, uint4 value, uint semanticIndex)
 {
     return (swappedMask & (1u << semanticIndex)) != 0 ? value.yxwz : value;
+}
+
+// The tangent basis decoded per element, since one declaration can mix the
+// packings (PGR4's riders: an 11:11:10 NORMAL with a DEC4N TANGENT). Bit
+// 8 * semantic + index (NORMAL 0, TANGENT 1, BINORMAL 2) of g_Dec3NBasis
+// marks DEC3N/DEC4N, of g_R11G11B10Basis the 11:11:10 packing; any other
+// type is a float the input assembler already converted.
+float4 tfetchPackedBasis(uint dec3nMask, uint r11g11b10Mask, float4 value, uint bit)
+{
+    if ((dec3nMask >> bit) & 1u)
+        return decodeDec3N(asuint(value.x));
+    if ((r11g11b10Mask >> bit) & 1u)
+    {
+        uint v = asuint(value.x);
+        return float4(
+            (v & 0x00000400 ? -1.0 : 0.0) + ((v & 0x3FF) / 1024.0),
+            (v & 0x00200000 ? -1.0 : 0.0) + (((v >> 11) & 0x3FF) / 1024.0),
+            (v & 0x80000000 ? -1.0 : 0.0) + (((v >> 22) & 0x1FF) / 512.0),
+            0.0);
+    }
+    return value;
 }
 #endif
 
